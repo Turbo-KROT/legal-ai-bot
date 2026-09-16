@@ -24,10 +24,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # Создаём клиент GigaChat
+# Создаём клиент GigaChat
 giga = GigaChat(
     credentials=GIGACHAT_CREDENTIALS,
-    verify_ssl_certs=False,
-    model="GigaChat"
+    scope="GIGACHAT_API_PERS",
+    verify_ssl_certs=False
 )
 
 # Простое хранилище пользователей (в памяти)
