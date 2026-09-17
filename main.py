@@ -184,7 +184,7 @@ async def process_skip_city(callback: CallbackQuery, state: FSMContext):
     user["city"] = None
     
     await callback.message.edit_text("📍 <b>Город не указан.</b>", parse_mode="HTML")
-    await callback.message.answer("Опишите вашу проблему текстом или <b>отправьте голосовое сообщение 🎙</b>:")
+    await callback.message.answer("Опишите вашу проблему текстом или отправьте голосовое сообщение 🎙:")
     await state.set_state(UserForm.waiting_for_question)
     await callback.answer()
 
