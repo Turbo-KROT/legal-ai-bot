@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -16,85 +17,81 @@ from gigachat import GigaChat
 
 from config import BOT_TOKEN, GIGACHAT_CREDENTIALS, ADMIN_ID
 
-# Настройка логирования (чтобы видеть, что происходит)
 logging.basicConfig(level=logging.INFO)
 
-# Создаём бота и диспетчер
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Создаём клиент GigaChat
-# Создаём клиент GigaChat
 giga = GigaChat(
     credentials=GIGACHAT_CREDENTIALS,
     scope="GIGACHAT_API_PERS",
+    model="GigaChat-2",
     verify_ssl_certs=False
 )
 
-# Простое хранилище пользователей (в памяти)
-# Формат: {user_id: {"accepted": True/False, "city": "Москва"}}
-users_data = {}
+# База данных пользователей в памяти
+# db = { user_id: {"accepted": True, "city": "Москва", "history": []} }
+db = {}
 
-
-# ============ СОСТОЯНИЯ ДЛЯ АНКЕТЫ ============
 class UserForm(StatesGroup):
     waiting_for_city = State()
     waiting_for_question = State()
 
-
-# ============ СИСТЕМНЫЙ ПРОМПТ ДЛЯ AI ============
-SYSTEM_PROMPT = """Ты — опытный юридический консультант с 20-летним стажем работы 
-в российском праве. Ты специализируешься на всех отраслях права РФ: 
-гражданском, уголовном, административном, трудовом, семейном, жилищном, 
-налоговом, земельном.
-
-Твои задачи:
-1. Отвечать на юридические вопросы пользователей, ссылаясь на конкретные 
-   статьи российских кодексов и федеральных законов.
-2. Давать чёткие практические рекомендации: что делать, куда обращаться, 
-   какие документы нужны.
-3. Учитывать регион (город) пользователя, если это влияет на подсудность 
-   или региональное законодательство.
+SYSTEM_PROMPT = """Ты — высококвалифицированный юридический AI-консультант по праву РФ.
+Твоя задача — вести грамотный, профессиональный диалог с пользователем, анализировать его ситуацию и давать точные юридические разборы со ссылками на законы РФ (ГК, УК, ТК, КоАП, СК, ЖК и др.).
 
 Формат ответа:
-📌 КРАТКИЙ ОТВЕТ (2-3 предложения по сути)
-📖 ОБОСНОВАНИЕ (ссылки на статьи законов)
-💡 РЕКОМЕНДАЦИИ (пошаговый план действий)
-⚠️ ВАЖНО (риски, сроки, подводные камни)
+📌 КРАТКИЙ ВЕРДИКТ
+📖 ПРАВОВОЕ ОБОСНОВАНИЕ (статьи законов)
+💡 ПОШАГОВЫЙ ПЛАН ДЕЙСТВИЙ
+⚠️ РИСКИ И СРОКИ
 
 Правила:
-- Отвечай простым языком, без сложного юридического жаргона.
-- Ссылайся ТОЛЬКО на реально существующие статьи. Если не уверен — 
-  честно скажи: «Ваша ситуация требует индивидуального разбора 
-  специалистом. Рекомендую бесплатную консультацию юриста-партнёра. 
-  Напишите /lawyer».
-- НИКОГДА не говори «я не могу» или «я не знаю». Вместо этого 
-  предлагай обратиться к юристу.
-- Уголовные дела, сложные споры о наследстве и разделе имущества — 
-  всегда рекомендуй консультацию юриста через /lawyer.
-- Ответ должен быть не длиннее 1500 символов."""
+- Учитывай контекст предыдущих сообщений в диалоге.
+- Пиши строго, профессионально, но понятно.
+- Не выдумывай статьи. Если не уверен — рекомендуй записаться к живиму юристу через /lawyer.
+- Ответ до 1500 символов."""
+
+# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+def get_user(user_id: int):
+    if user_id not in db:
+        db[user_id] = {"accepted": False, "city": None, "history": []}
+    return db[user_id]
+
+# Ключевые слова для смены города
+CITY_CHANGE_KEYWORDS = ["сменить город", "поменять город", "другой город", "неправильный город", "изменить город", "смена города"]
 
 
-# ============ ОБРАБОТЧИК /start И "Привет" ============
+# ============ ОБРАБОТЧИК /start ============
 @dp.message(CommandStart())
-@dp.message(F.text.lower().in_(["привет", "здравствуйте", "здравствуй", "hi", "hello"]))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
+    user = get_user(user_id)
     
-    # Приветственное сообщение
+    # Если пользователь УЖЕ принимал соглашение
+    if user["accepted"]:
+        city_info = f" (Ваш город: <b>{user['city']}</b>)" if user['city'] else ""
+        await message.answer(
+            f"👋 <b>С возвращением!</b>{city_info}\n\n"
+            f"Я готов продолжить работу. Задайте ваш вопрос или опишите ситуацию.\n\n"
+            f"💡 <i>Чтобы сменить город, напишите «Сменить город».</i>",
+            parse_mode="HTML"
+        )
+        await state.set_state(UserForm.waiting_for_question)
+        return
+
+    # Если НОВЫЙ пользователь
     welcome_text = (
-        "👋 <b>Приветствую! Я — правовой AI-консультант.</b>\n\n"
-        "Помогу вам разобраться в юридических вопросах:\n\n"
-        "🔹 Отвечу на вопросы по любой отрасли права РФ\n"
-        "🔹 Проанализирую ваш документ (фото или PDF)\n"
-        "🔹 Помогу составить шаблон документа\n"
-        "🔹 Дам пошаговый план действий в вашей ситуации\n"
-        "🔹 При необходимости — соединю с живым юристом\n\n"
-        "Работаю 24/7, отвечаю за секунды."
+        "⚖️ <b>Правовой AI-Консультант</b>\n\n"
+        "Профессиональный сервис экспресс-анализа юридических ситуаций, "
+        "проверки документов и подготовки правовых решений на базе искусственного интеллекта.\n\n"
+        "⚡️ <i>Анализ ситуаций за 5 секунд • Работа 24/7</i>"
     )
     await message.answer(welcome_text, parse_mode="HTML")
     
-    # Отправляем PDF с соглашением и FAQ
+    # Пауза 2.5 секунды перед документами
+    await asyncio.sleep(2.5)
+    
     try:
         agreement = FSInputFile("agreement.pdf")
         faq = FSInputFile("faq.pdf")
@@ -102,17 +99,11 @@ async def cmd_start(message: Message):
         await message.answer_document(faq, caption="❓ Часто задаваемые вопросы (FAQ)")
     except Exception as e:
         logging.error(f"Ошибка отправки PDF: {e}")
-        await message.answer("⚠️ Не удалось загрузить документы. Обратитесь к администратору.")
-    
-    # Сообщение с кнопками согласия
+
     consent_text = (
-        "📋 <b>Перед началом работы</b>\n\n"
-        "Пожалуйста, ознакомьтесь с Пользовательским соглашением и FAQ выше.\n\n"
-        "Нажимая «Соглашаюсь», вы подтверждаете, что:\n"
-        "• Бот является информационным помощником, а не юристом\n"
-        "• Ответы могут содержать неточности\n"
-        "• Документы, создаваемые ботом, не являются официальными\n"
-        "• Ваши данные не хранятся и не передаются без вашего согласия"
+        "📋 <b>Условия использования сервиса</b>\n\n"
+        "Перед началом работы ознакомьтесь с Соглашением и FAQ выше.\n"
+        "Нажимая «Соглашаюсь», вы подтверждаете acceptance условий."
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -123,121 +114,123 @@ async def cmd_start(message: Message):
     await message.answer(consent_text, reply_markup=keyboard, parse_mode="HTML")
 
 
-# ============ ОБРАБОТЧИК КНОПКИ "СОГЛАШАЮСЬ" ============
+# ============ ПРИНЯТИЕ СОГЛАШЕНИЯ ============
 @dp.callback_query(F.data == "accept")
 async def process_accept(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    users_data[user_id] = {"accepted": True, "city": None}
+    user = get_user(callback.from_user.id)
+    user["accepted"] = True
     
-    await callback.message.edit_text(
-        "✅ <b>Спасибо! Вы приняли условия использования.</b>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("✅ <b>Условия использования приняты.</b>", parse_mode="HTML")
+    
+    # Запрос города с кнопкой [Пропустить]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Не указывать (Пропустить)", callback_data="skip_city")]
+    ])
     
     await callback.message.answer(
-        "🏙 <b>Из какого вы города?</b>\n\n"
-        "Это нужно, чтобы учитывать региональные особенности и подсудность.",
+        "🏙 <b>Укажите ваш город или населенный пункт:</b>\n\n"
+        "Это необходимо для учета регионального законодательства и подсудности судов.",
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
-    
-    # Переводим пользователя в состояние ожидания города
     await state.set_state(UserForm.waiting_for_city)
     await callback.answer()
 
 
-# ============ ОБРАБОТЧИК КНОПКИ "НЕ СОГЛАШАЮСЬ" ============
 @dp.callback_query(F.data == "decline")
 async def process_decline(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "😔 К сожалению, без принятия условий использование сервиса невозможно.\n\n"
-        "Если передумаете — напишите /start"
-    )
+    await callback.message.edit_text("😔 Без принятия условий доступ к сервису ограничен. Напишите /start для повтора.")
     await callback.answer()
 
 
-# ============ ОБРАБОТЧИК ВВОДА ГОРОДА ============
-@dp.message(UserForm.waiting_for_city)
-async def process_city(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    city = message.text.strip()
+# ============ КНОПКА [ПРОПУСТИТЬ ГОРОД] ============
+@dp.callback_query(F.data == "skip_city")
+async def process_skip_city(callback: CallbackQuery, state: FSMContext):
+    user = get_user(callback.from_user.id)
+    user["city"] = None
     
-    # Сохраняем город
-    if user_id not in users_data:
-        users_data[user_id] = {"accepted": True, "city": city}
-    else:
-        users_data[user_id]["city"] = city
+    await callback.message.edit_text("📍 <b>Город не указан.</b>", parse_mode="HTML")
+    await callback.message.answer("Опишите вашу проблему или задайте юридический вопрос:")
+    await state.set_state(UserForm.waiting_for_question)
+    await callback.answer()
+
+
+# ============ ВВОД ГОРОДА ============
+@dp.message(UserForm.waiting_for_city)
+async def process_city_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    
+    # Если случайно ввел ключевое слово смены города
+    if text.lower() in CITY_CHANGE_KEYWORDS:
+        await message.answer("Введите название вашего города:")
+        return
+
+    user = get_user(message.from_user.id)
+    user["city"] = text
     
     await message.answer(
-        f"📍 Отлично, ваш город: <b>{city}</b>\n\n"
-        f"❓ <b>Опишите ваш вопрос или ситуацию.</b>\n\n"
-        f"Например:\n"
-        f"• «Работодатель не выплатил зарплату 2 месяца»\n"
-        f"• «Соседи затопили квартиру, что делать?»\n"
-        f"• «Как расторгнуть договор с фитнес-клубом?»",
+        f"📍 Населенный пункт сохранен: <b>{text}</b>\n\n"
+        f"Опишите вашу правовую ситуацию или задайте вопрос:",
         parse_mode="HTML"
     )
-    
     await state.set_state(UserForm.waiting_for_question)
 
 
-# ============ ОБРАБОТЧИК ВОПРОСА ПОЛЬЗОВАТЕЛЯ ============
+# ============ ОБРАБОТКА ВОПРОСОВ И ИСТОРИИ ДИАЛОГА ============
 @dp.message(UserForm.waiting_for_question)
+@dp.message(F.text)
 async def process_question(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    question = message.text.strip()
-    city = users_data.get(user_id, {}).get("city", "не указан")
-    
-    # Показываем, что бот думает
-    thinking_msg = await message.answer("🤔 Анализирую вашу ситуацию...")
-    
+    text = message.text.strip()
+    user = get_user(user_id)
+
+    # Проверка на запрос смены города
+    if text.lower() in CITY_CHANGE_KEYWORDS:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚫 Сбросить город", callback_data="skip_city")]
+        ])
+        await message.answer("🏙 Введите новое название города или нажмите кнопку:", reply_markup=keyboard)
+        await state.set_state(UserForm.waiting_for_city)
+        return
+
+    thinking_msg = await message.answer("🔍 <i>Анализирую правовую ситуацию и законодательство...</i>", parse_mode="HTML")
+
     try:
-        # Формируем полный запрос
-        full_prompt = (
-            f"Город пользователя: {city}\n\n"
-            f"Вопрос: {question}"
-        )
+        # Сохраняем вопрос пользователя в историю
+        user["history"].append({"role": "user", "content": text})
         
-        # Отправляем в GigaChat
-        response = giga.chat({
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": full_prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 1500
-        })
-        
+        # Храним только последние 6 сообщений (чтобы не перегружать память)
+        if len(user["history"]) > 6:
+            user["history"] = user["history"][-6:]
+
+        # Формируем контекст
+        city_context = f"\nРегион/Город пользователя: {user['city']}" if user['city'] else ""
+        system_content = SYSTEM_PROMPT + city_context
+
+        # Собираем запрос с историей
+        messages_payload = [{"role": "system", "content": system_content}] + user["history"]
+
+        # Вызов GigaChat
+        response = giga.chat({"messages": messages_payload})
         answer = response.choices[0].message.content
-        
-        # Удаляем сообщение "думаю..."
+
+        # Сохраняем ответ бота в историю
+        user["history"].append({"role": "assistant", "content": answer})
+
         await thinking_msg.delete()
-        
-        # Отправляем ответ + короткий футер
-        footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для точного решения: /lawyer</i>"
+
+        footer = "\n\n<i>ℹ️ Информация носит справочный характер. Связь с юристом: /lawyer</i>"
         await message.answer(answer + footer, parse_mode="HTML")
-        
-        # Предлагаем задать следующий вопрос
-        await message.answer(
-            "💬 Задайте следующий вопрос или напишите /start для сброса."
-        )
-        
+
     except Exception as e:
         logging.error(f"Ошибка GigaChat: {e}")
         await thinking_msg.delete()
-        await message.answer(
-            "⚠️ Произошла техническая ошибка. Попробуйте ещё раз через минуту.\n\n"
-            "Если ошибка повторяется — напишите /start"
-        )
-    
-    # Остаёмся в том же состоянии, чтобы можно было задавать ещё вопросы
-    # (не сбрасываем state)
+        await message.answer("⚠️ Произошла ошибка при обращении к AI. Попробуйте переформулировать вопрос.")
 
 
-# ============ ЗАПУСК БОТА ============
 async def main():
-    logging.info("Бот запускается...")
+    logging.info("Бот запущен.")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
