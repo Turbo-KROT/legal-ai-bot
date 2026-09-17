@@ -1,6 +1,7 @@
 import asyncio
 import logging
-import re
+import os
+import subprocess
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -14,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from gigachat import GigaChat
+import speech_recognition as sr
 
 from config import BOT_TOKEN, GIGACHAT_CREDENTIALS, ADMIN_ID
 
@@ -29,8 +31,7 @@ giga = GigaChat(
     verify_ssl_certs=False
 )
 
-# База данных пользователей в памяти
-# db = { user_id: {"accepted": True, "city": "Москва", "history": []} }
+# База данных пользователей
 db = {}
 
 class UserForm(StatesGroup):
@@ -49,17 +50,55 @@ SYSTEM_PROMPT = """Ты — высококвалифицированный юр�
 Правила:
 - Учитывай контекст предыдущих сообщений в диалоге.
 - Пиши строго, профессионально, но понятно.
-- Не выдумывай статьи. Если не уверен — рекомендуй записаться к живиму юристу через /lawyer.
+- Не выдумывай статьи. Если не уверен — рекомендуй записаться к живому юристу через /lawyer.
 - Ответ до 1500 символов."""
 
-# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_user(user_id: int):
     if user_id not in db:
         db[user_id] = {"accepted": False, "city": None, "history": []}
     return db[user_id]
 
-# Ключевые слова для смены города
 CITY_CHANGE_KEYWORDS = ["сменить город", "поменять город", "другой город", "неправильный город", "изменить город", "смена города"]
+
+# ============ ФУНКЦИЯ РАСПОЗНАВАНИЯ ГОЛОСА ============
+async def transcribe_voice_message(voice_message: Message) -> str:
+    """Скачивает голосовое сообщение, конвертирует и распознает в текст"""
+    file_id = voice_message.voice.file_id
+    file = await bot.get_file(file_id)
+    
+    ogg_path = f"voice_{file_id}.ogg"
+    wav_path = f"voice_{file_id}.wav"
+    
+    try:
+        # Скачиваем .ogg
+        await bot.download_file(file.file_path, ogg_path)
+        
+        # Конвертируем .ogg в .wav через ffmpeg
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", ogg_path, wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        
+        # Распознаем через Google Speech Recognition (бесплатно, язык русский)
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data, language="ru-RU")
+            return text
+            
+    except sr.UnknownValueError:
+        return None  # Не удалось разобрать речь
+    except Exception as e:
+        logging.error(f"Ошибка распознавания речи: {e}")
+        return None
+    finally:
+        # Гарантированное удаление временных аудиофайлов (Zero-Retention)
+        if os.path.exists(ogg_path):
+            os.remove(ogg_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 
 # ============ ОБРАБОТЧИК /start ============
@@ -68,28 +107,26 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     user = get_user(user_id)
     
-    # Если пользователь УЖЕ принимал соглашение
     if user["accepted"]:
         city_info = f" (Ваш город: <b>{user['city']}</b>)" if user['city'] else ""
         await message.answer(
             f"👋 <b>С возвращением!</b>{city_info}\n\n"
-            f"Я готов продолжить работу. Задайте ваш вопрос или опишите ситуацию.\n\n"
+            f"Задайте ваш вопрос текстом или <b>запишите голосовое сообщение</b> 🎙\n\n"
             f"💡 <i>Чтобы сменить город, напишите «Сменить город».</i>",
             parse_mode="HTML"
         )
         await state.set_state(UserForm.waiting_for_question)
         return
 
-    # Если НОВЫЙ пользователь
     welcome_text = (
         "⚖️ <b>Правовой AI-Консультант</b>\n\n"
         "Профессиональный сервис экспресс-анализа юридических ситуаций, "
         "проверки документов и подготовки правовых решений на базе искусственного интеллекта.\n\n"
-        "⚡️ <i>Анализ ситуаций за 5 секунд • Работа 24/7</i>"
+        "🎙 <b>Принимаю текстовые и голосовые сообщения!</b>\n"
+        "⚡️ <i>Анализ ситуаций за секунды • Работа 24/7</i>"
     )
     await message.answer(welcome_text, parse_mode="HTML")
     
-    # Пауза 2.5 секунды перед документами
     await asyncio.sleep(2.5)
     
     try:
@@ -114,7 +151,6 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(consent_text, reply_markup=keyboard, parse_mode="HTML")
 
 
-# ============ ПРИНЯТИЕ СОГЛАШЕНИЯ ============
 @dp.callback_query(F.data == "accept")
 async def process_accept(callback: CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
@@ -122,7 +158,6 @@ async def process_accept(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text("✅ <b>Условия использования приняты.</b>", parse_mode="HTML")
     
-    # Запрос города с кнопкой [Пропустить]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚫 Не указывать (Пропустить)", callback_data="skip_city")]
     ])
@@ -143,24 +178,21 @@ async def process_decline(callback: CallbackQuery):
     await callback.answer()
 
 
-# ============ КНОПКА [ПРОПУСТИТЬ ГОРОД] ============
 @dp.callback_query(F.data == "skip_city")
 async def process_skip_city(callback: CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
     user["city"] = None
     
     await callback.message.edit_text("📍 <b>Город не указан.</b>", parse_mode="HTML")
-    await callback.message.answer("Опишите вашу проблему или задайте юридический вопрос:")
+    await callback.message.answer("Опишите вашу проблему текстом или <b>отправьте голосовое сообщение 🎙</b>:")
     await state.set_state(UserForm.waiting_for_question)
     await callback.answer()
 
 
-# ============ ВВОД ГОРОДА ============
 @dp.message(UserForm.waiting_for_city)
 async def process_city_input(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = message.text.strip() if message.text else ""
     
-    # Если случайно ввел ключевое слово смены города
     if text.lower() in CITY_CHANGE_KEYWORDS:
         await message.answer("Введите название вашего города:")
         return
@@ -170,21 +202,59 @@ async def process_city_input(message: Message, state: FSMContext):
     
     await message.answer(
         f"📍 Населенный пункт сохранен: <b>{text}</b>\n\n"
-        f"Опишите вашу правовую ситуацию или задайте вопрос:",
+        f"Опишите вашу ситуацию текстом или <b>отправьте голосовое сообщение 🎙</b>:",
         parse_mode="HTML"
     )
     await state.set_state(UserForm.waiting_for_question)
 
 
-# ============ ОБРАБОТКА ВОПРОСОВ И ИСТОРИИ ДИАЛОГА ============
-@dp.message(UserForm.waiting_for_question)
+# ============ ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ ============
+@dp.message(UserForm.waiting_for_question, F.voice)
+@dp.message(F.voice)
+async def process_voice_question(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    if not user["accepted"]:
+        await message.answer("⚠️ Пожалуйста, сначала примите условия использования: напишите /start")
+        return
+
+    status_msg = await message.answer("🎙 <i>Распознаю голосовое сообщение...</i>", parse_mode="HTML")
+    
+    # Распознаем речь
+    recognized_text = await transcribe_voice_message(message)
+    
+    if not recognized_text:
+        await status_msg.edit_text(
+            "🎙 ⚠️ <b>Не удалось четко разобрать речь.</b>\n\n"
+            "Пожалуйста, повторите запись чуть громче и медленнее или напишите вопрос текстом.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Показываем человеку распознанный текст
+    await status_msg.edit_text(
+        f"🎙 <b>Распознанный запрос:</b>\n«<i>{recognized_text}</i>»\n\n"
+        f"🔍 <i>Анализирую правовую ситуацию...</i>",
+        parse_mode="HTML"
+    )
+    
+    # Передаем распознанный текст в обработчик ИИ
+    await run_ai_analysis(message, recognized_text, user)
+
+
+# ============ ОБРАБОТКА ТЕКСТОВЫХ ВОПРОСОВ ============
+@dp.message(UserForm.waiting_for_question, F.text)
 @dp.message(F.text)
-async def process_question(message: Message, state: FSMContext):
+async def process_text_question(message: Message, state: FSMContext):
     user_id = message.from_user.id
     text = message.text.strip()
     user = get_user(user_id)
 
-    # Проверка на запрос смены города
+    if not user["accepted"]:
+        await message.answer("⚠️ Пожалуйста, сначала примите условия использования: напишите /start")
+        return
+
     if text.lower() in CITY_CHANGE_KEYWORDS:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚫 Сбросить город", callback_data="skip_city")]
@@ -194,42 +264,42 @@ async def process_question(message: Message, state: FSMContext):
         return
 
     thinking_msg = await message.answer("🔍 <i>Анализирую правовую ситуацию и законодательство...</i>", parse_mode="HTML")
+    await run_ai_analysis(message, text, user, thinking_msg)
 
+
+# ============ ОБЩАЯ ФУНКЦИЯ ВЫЗОВА ИИ ============
+async def run_ai_analysis(message: Message, question_text: str, user: dict, temp_msg: Message = None):
     try:
-        # Сохраняем вопрос пользователя в историю
-        user["history"].append({"role": "user", "content": text})
+        user["history"].append({"role": "user", "content": question_text})
         
-        # Храним только последние 6 сообщений (чтобы не перегружать память)
         if len(user["history"]) > 6:
             user["history"] = user["history"][-6:]
 
-        # Формируем контекст
         city_context = f"\nРегион/Город пользователя: {user['city']}" if user['city'] else ""
         system_content = SYSTEM_PROMPT + city_context
 
-        # Собираем запрос с историей
         messages_payload = [{"role": "system", "content": system_content}] + user["history"]
 
-        # Вызов GigaChat
         response = giga.chat({"messages": messages_payload})
         answer = response.choices[0].message.content
 
-        # Сохраняем ответ бота в историю
         user["history"].append({"role": "assistant", "content": answer})
 
-        await thinking_msg.delete()
+        if temp_msg:
+            await temp_msg.delete()
 
         footer = "\n\n<i>ℹ️ Информация носит справочный характер. Связь с юристом: /lawyer</i>"
         await message.answer(answer + footer, parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"Ошибка GigaChat: {e}")
-        await thinking_msg.delete()
+        if temp_msg:
+            await temp_msg.delete()
         await message.answer("⚠️ Произошла ошибка при обращении к AI. Попробуйте переформулировать вопрос.")
 
 
 async def main():
-    logging.info("Бот запущен.")
+    logging.info("Бот запущен с поддержкой голосовых сообщений.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
