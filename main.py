@@ -68,7 +68,19 @@ def get_user(user_id: int):
         db[user_id] = {"accepted": False, "city": None, "history": []}
     return db[user_id]
 
+def sanitize_text_for_pdf(text: str) -> str:
+    """Очищает текст от символов, вызывающих ошибку верстки PDF"""
+    replacements = {
+        '—': '-', '–': '-', '…': '...',
+        '«': '"', '»': '"', '“': '"', '”': '"',
+        '‘': "'", '’': "'", '\xa0': ' ', '\t': '    '
+    }
+    for orig, repl in replacements.items():
+        text = text.replace(orig, repl)
+    return text
+
 def create_pdf(text, filename):
+    text = sanitize_text_for_pdf(text)
     pdf = FPDF()
     pdf.add_page()
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -111,7 +123,11 @@ async def transcribe_voice(file_id: str) -> str:
     wav_path = f"v_{file_id}.wav"
     try:
         await bot.download_file(file.file_path, ogg_path)
-        proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", ogg_path, wav_path, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        # Оптимизированная конвертация 16kHz Mono для идеального распознавания речи
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
         await proc.communicate()
         return await asyncio.to_thread(recognize_audio, wav_path)
     except Exception as e:
@@ -126,7 +142,8 @@ async def extract_text_from_photo(file_id: str) -> str:
     photo_path = f"photo_{file_id}.jpg"
     await bot.download_file(file.file_path, photo_path)
     try:
-        return await asyncio.to_thread(pytesseract.image_to_string, Image.open(photo_path), lang='rus')
+        text = await asyncio.to_thread(pytesseract.image_to_string, Image.open(photo_path), lang='rus')
+        return text.strip()
     finally:
         if os.path.exists(photo_path): os.remove(photo_path)
 
@@ -139,7 +156,7 @@ async def extract_text_from_pdf(file_id: str) -> str:
         doc = fitz.open(pdf_path)
         for page in doc:
             text += page.get_text()
-        return text
+        return text.strip()
     finally:
         if os.path.exists(pdf_path): os.remove(pdf_path)
 
@@ -272,7 +289,9 @@ async def handle_input(message: Message, state: FSMContext):
 
     status = await message.answer("🔍 <i>Анализирую данные...</i>", parse_mode="HTML")
     
+    caption = message.caption.strip() if message.caption else ""
     input_text = ""
+    
     if message.text:
         input_text = message.text
     elif message.voice:
@@ -282,13 +301,25 @@ async def handle_input(message: Message, state: FSMContext):
             await message.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
     elif message.photo:
         await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
-        input_text = f"[ТЕКСТ С ФОТО ОБРАЗЦА]:\n{await extract_text_from_photo(message.photo[-1].file_id)}"
+        ocr_text = await extract_text_from_photo(message.photo[-1].file_id)
+        if not ocr_text or len(ocr_text) < 10:
+            await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>\n\nПожалуйста, сфотографируйте документ ближе, при хорошем освещении или отправьте его в формате PDF/текстом.", reply_markup=get_back_kb(), parse_mode="HTML")
+            return
+        input_text = f"Текст с фото документа:\n{ocr_text}"
+        if caption:
+            input_text += f"\n\nВопрос/указание пользователя к фото: {caption}"
     elif message.document and message.document.mime_type == "application/pdf":
         await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
-        input_text = f"[ТЕКСТ ИЗ PDF ОБРАЗЦА]:\n{await extract_text_from_pdf(message.document.file_id)}"
+        pdf_text = await extract_text_from_pdf(message.document.file_id)
+        if not pdf_text or len(pdf_text) < 10:
+            await status.edit_text("⚠️ <b>Не удалось извлечь текст из PDF-файла.</b>\n\nВозможно, это отсканированный документ без текстового слоя. Попробуйте отправить его как фото.", reply_markup=get_back_kb(), parse_mode="HTML")
+            return
+        input_text = f"Текст из PDF-документа:\n{pdf_text}"
+        if caption:
+            input_text += f"\n\nВопрос/указание пользователя к файлу: {caption}"
     
     if not input_text:
-        await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте передать информацию текстом.", reply_markup=get_back_kb())
+        await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте передать информацию текстом или повторить запись голоса.", reply_markup=get_back_kb())
         return
 
     try:
@@ -327,14 +358,14 @@ async def handle_input(message: Message, state: FSMContext):
                 await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
 
         elif curr_state == BotStates.doc_analyze_mode.state:
-            sys_prompt = "Ты юрист. Проанализируй текст документа, найди скрытые риски, ошибки и невыгодные условия."
+            sys_prompt = "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."
             res = giga.chat({"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]})
             ans = res.choices[0].message.content
-            await status.edit_text(f"🔍 <b>Результат анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
+            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"AI Error: {e}")
-        await status.edit_text("⚠️ Произошла ошибка. Попробуйте повторить запрос.", reply_markup=get_back_kb())
+        await status.edit_text("⚠️ Произошла ошибка при обработке запроса ИИ. Попробуйте повторить запрос.", reply_markup=get_back_kb())
 
 async def main():
     await dp.start_polling(bot)
