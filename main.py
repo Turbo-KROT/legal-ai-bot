@@ -69,7 +69,21 @@ def get_user(user_id: int):
     return db[user_id]
 
 def sanitize_text_for_pdf(text: str) -> str:
-    """Очищает текст от символов, вызывающих ошибку верстки PDF"""
+    """Удаляет эмодзи и спецсимволы, вызывающие ошибку верстки PDF"""
+    # Удаление эмодзи
+    emoji_pattern = re.compile(
+        "["
+        "\U00010000-\U0010FFFF"
+        "\u2600-\u27BF"
+        "\u2300-\u23FF"
+        "\u2B00-\u2BFF"
+        "\u2190-\u21FF"
+        "]+", 
+        flags=re.UNICODE
+    )
+    text = emoji_pattern.sub("", text)
+    
+    # Замена спецтипографики на стандарт
     replacements = {
         '—': '-', '–': '-', '…': '...',
         '«': '"', '»': '"', '“': '"', '”': '"',
@@ -80,33 +94,34 @@ def sanitize_text_for_pdf(text: str) -> str:
     return text
 
 def create_pdf(text, filename):
-    text = sanitize_text_for_pdf(text)
+    clean_text = sanitize_text_for_pdf(text)
     pdf = FPDF()
     pdf.add_page()
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     
     if os.path.exists(font_path):
-        pdf.add_font('DejaVu', '', font_path, uni=True)
+        pdf.add_font('DejaVu', '', font_path)
+        pdf.set_font('DejaVu', '', 11)
     else:
         pdf.set_font("Arial", size=11)
         
-    lines = text.strip().split('\n')
+    lines = clean_text.strip().split('\n')
     title_processed = False
     
     for line in lines:
-        clean_line = line.strip()
-        if not clean_line:
-            pdf.ln(5)
+        c_line = line.strip()
+        if not c_line:
+            pdf.ln(4)
             continue
             
         if not title_processed:
             if os.path.exists(font_path): pdf.set_font('DejaVu', '', 14)
-            pdf.multi_cell(0, 8, clean_line, align='C')
+            pdf.multi_cell(0, 8, c_line, align='C')
             title_processed = True
-            pdf.ln(5)
+            pdf.ln(4)
         else:
             if os.path.exists(font_path): pdf.set_font('DejaVu', '', 11)
-            pdf.multi_cell(0, 6, "    " + clean_line, align='J')
+            pdf.multi_cell(0, 6, "    " + c_line, align='J')
             
     pdf.output(filename)
 
@@ -123,11 +138,7 @@ async def transcribe_voice(file_id: str) -> str:
     wav_path = f"v_{file_id}.wav"
     try:
         await bot.download_file(file.file_path, ogg_path)
-        # Оптимизированная конвертация 16kHz Mono для идеального распознавания речи
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
+        proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.communicate()
         return await asyncio.to_thread(recognize_audio, wav_path)
     except Exception as e:
@@ -143,7 +154,10 @@ async def extract_text_from_photo(file_id: str) -> str:
     await bot.download_file(file.file_path, photo_path)
     try:
         text = await asyncio.to_thread(pytesseract.image_to_string, Image.open(photo_path), lang='rus')
-        return text.strip()
+        return text.strip() if text else ""
+    except Exception as e:
+        logging.error(f"OCR Error: {e}")
+        return ""
     finally:
         if os.path.exists(photo_path): os.remove(photo_path)
 
@@ -157,6 +171,9 @@ async def extract_text_from_pdf(file_id: str) -> str:
         for page in doc:
             text += page.get_text()
         return text.strip()
+    except Exception as e:
+        logging.error(f"PDF Extract Error: {e}")
+        return ""
     finally:
         if os.path.exists(pdf_path): os.remove(pdf_path)
 
@@ -277,7 +294,7 @@ async def mode_doc_analyze(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("🔍 <b>РЕЖИМ: Разбор документа</b>\n\nПришлите <b>фото, PDF</b> или текст документа, и я найду в нем риски и ошибки.", reply_markup=get_back_kb(), parse_mode="HTML")
     await state.set_state(BotStates.doc_analyze_mode)
 
-# ============ ЕДИНЫЙ ОБРАБОТЧИК ВХОДЯЩИХ (ТЕКСТ, ГОЛОС, ФОТО, PDF) ============
+# ============ ЕДИНЫЙ ОБРАБОТЧИК ВХОДЯЩИХ ============
 @dp.message(F.text | F.voice | F.photo | F.document)
 async def handle_input(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
@@ -289,40 +306,38 @@ async def handle_input(message: Message, state: FSMContext):
 
     status = await message.answer("🔍 <i>Анализирую данные...</i>", parse_mode="HTML")
     
-    caption = message.caption.strip() if message.caption else ""
-    input_text = ""
-    
-    if message.text:
-        input_text = message.text
-    elif message.voice:
-        await status.edit_text("🎙 <i>Распознаю голос...</i>", parse_mode="HTML")
-        input_text = await transcribe_voice(message.voice.file_id)
-        if input_text:
-            await message.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
-    elif message.photo:
-        await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
-        ocr_text = await extract_text_from_photo(message.photo[-1].file_id)
-        if not ocr_text or len(ocr_text) < 10:
-            await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>\n\nПожалуйста, сфотографируйте документ ближе, при хорошем освещении или отправьте его в формате PDF/текстом.", reply_markup=get_back_kb(), parse_mode="HTML")
-            return
-        input_text = f"Текст с фото документа:\n{ocr_text}"
-        if caption:
-            input_text += f"\n\nВопрос/указание пользователя к фото: {caption}"
-    elif message.document and message.document.mime_type == "application/pdf":
-        await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
-        pdf_text = await extract_text_from_pdf(message.document.file_id)
-        if not pdf_text or len(pdf_text) < 10:
-            await status.edit_text("⚠️ <b>Не удалось извлечь текст из PDF-файла.</b>\n\nВозможно, это отсканированный документ без текстового слоя. Попробуйте отправить его как фото.", reply_markup=get_back_kb(), parse_mode="HTML")
-            return
-        input_text = f"Текст из PDF-документа:\n{pdf_text}"
-        if caption:
-            input_text += f"\n\nВопрос/указание пользователя к файлу: {caption}"
-    
-    if not input_text:
-        await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте передать информацию текстом или повторить запись голоса.", reply_markup=get_back_kb())
-        return
-
     try:
+        caption = message.caption.strip() if message.caption else ""
+        input_text = ""
+        
+        if message.text:
+            input_text = message.text
+        elif message.voice:
+            await status.edit_text("🎙 <i>Распознаю голос...</i>", parse_mode="HTML")
+            input_text = await transcribe_voice(message.voice.file_id)
+            if input_text:
+                await message.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
+        elif message.photo:
+            await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
+            ocr_text = await extract_text_from_photo(message.photo[-1].file_id)
+            if not ocr_text or len(ocr_text) < 5:
+                await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>\n\nПожалуйста, сфотографируйте документ ближе и при хорошем освещении.", reply_markup=get_back_kb(), parse_mode="HTML")
+                return
+            input_text = f"Текст с фото документа:\n{ocr_text}"
+            if caption: input_text += f"\n\nУказание пользователя к фото: {caption}"
+        elif message.document:
+            await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
+            pdf_text = await extract_text_from_pdf(message.document.file_id)
+            if not pdf_text or len(pdf_text) < 5:
+                await status.edit_text("⚠️ <b>Не удалось извлечь текст из файла.</b>\n\nПопробуйте отправить документ как фото.", reply_markup=get_back_kb(), parse_mode="HTML")
+                return
+            input_text = f"Текст из PDF-документа:\n{pdf_text}"
+            if caption: input_text += f"\n\nУказание пользователя к файлу: {caption}"
+        
+        if not input_text:
+            await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте повторить передачу.", reply_markup=get_back_kb())
+            return
+
         if curr_state == BotStates.qa_mode.state:
             user["history"].append({"role": "user", "content": input_text})
             if len(user["history"]) > 6: user["history"] = user["history"][-6:]
@@ -352,7 +367,7 @@ async def handle_input(message: Message, state: FSMContext):
                     os.remove(pdf_name)
                 except Exception as e:
                     logging.error(f"PDF Error: {e}")
-                    await status.edit_text("⚠️ Ошибка верстки PDF. Попробуйте еще раз.", reply_markup=get_back_kb())
+                    await status.edit_text("⚠️ Ошибка верстки PDF. Попробуйте сформировать запрос иначе.", reply_markup=get_back_kb())
             else:
                 user["history"].append({"role": "assistant", "content": ans})
                 await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
