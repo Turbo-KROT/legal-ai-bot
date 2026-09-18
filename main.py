@@ -45,16 +45,23 @@ class BotStates(StatesGroup):
     doc_gen_mode = State()
     doc_analyze_mode = State()
 
-# ============ СИСТЕМНЫЕ ПРОМПТЫ ============
-PROMPT_QA = """Ты — высококвалифицированный юридический AI-консультант по праву РФ.
+# ============ УСИЛЕННЫЕ СИСТЕМНЫЕ ПРОМПТЫ ============
+PROMPT_QA = """Ты — высококвалифицированный юридический AI-консультант по праву РФ и защите прав граждан.
+Твоя цель — дать глубокий, максимально информативный, практический и юридически точный ответ.
+
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
+1. Раскрывай ключевые нормы права, права граждан и обязанности государственных органов/должностных лиц.
+2. В вопросах общения с полицией и гос. органами ОБЯЗАТЕЛЬНО ссылайся на Конституцию РФ (ст. 29, 45, 51 и др.), Федеральный закон № 3-ФЗ «О полиции» (ст. 8 — принцип открытости и публичности, ст. 5 — соблюдение прав и свобод), УПК РФ, КоАП РФ.
+3. Объясняй гражданину его законные права на видеофиксацию, порядок проверки документов и алгоритм защиты при неправомерных действиях (жалобы в прокуратуру, УСБ, суд).
+
 Отвечай СТРОГО по следующей структуре (используй эмодзи):
 
-📌 КРАТКИЙ ВЕРДИКТ: (1-2 предложения сути)
-📖 ПРАВОВОЕ ОБОСНОВАНИЕ: (ссылки на статьи кодексов РФ)
-💡 ПЛАН ДЕЙСТВИЙ: (что делать пошагово)
-⚠️ РИСКИ И СРОКИ: (на что обратить внимание)
+📌 КРАТКИЙ ВЕРДИКТ: (Четкая суть ответа и главная правовая позиция)
+📖 ПРАВОВОЕ ОБОСНОВАНИЕ: (Подробный разбор статей законов, кодексов РФ, прав гражданина и обязанностей органов)
+💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции для защиты своих прав)
+⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни и важные нюансы)
 
-Не пиши ничего лишнего. Соблюдай профессиональный тон."""
+Пиши профессионально, содержательно, без пустой воды, но максимально полно по существу."""
 
 PROMPT_DOC_GEN = """Ты — опытный юрист-делопроизводитель РФ. Твоя задача — составить юридический документ.
 Если пользователь просит составить документ, но не дал нужных данных — НАПИШИ ТЕКСТОМ, какие данные нужны (ФИО, адрес, суммы и т.д.).
@@ -68,22 +75,21 @@ def get_user(user_id: int):
         db[user_id] = {"accepted": False, "city": None, "history": []}
     return db[user_id]
 
-def sanitize_text_for_pdf(text: str) -> str:
-    """Удаляет эмодзи и спецсимволы, вызывающие ошибку верстки PDF"""
-    # Удаление эмодзи
+def clean_markdown_and_symbols(text: str) -> str:
+    """Удаляет Markdown-разметку, эмодзи и спецсимволы перед генерацией PDF"""
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'#(.*?)\n', r'\1\n', text)
+    
     emoji_pattern = re.compile(
         "["
         "\U00010000-\U0010FFFF"
-        "\u2600-\u27BF"
-        "\u2300-\u23FF"
-        "\u2B00-\u2BFF"
-        "\u2190-\u21FF"
+        "\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF"
         "]+", 
         flags=re.UNICODE
     )
     text = emoji_pattern.sub("", text)
     
-    # Замена спецтипографики на стандарт
     replacements = {
         '—': '-', '–': '-', '…': '...',
         '«': '"', '»': '"', '“': '"', '”': '"',
@@ -94,15 +100,23 @@ def sanitize_text_for_pdf(text: str) -> str:
     return text
 
 def create_pdf(text, filename):
-    clean_text = sanitize_text_for_pdf(text)
+    clean_text = clean_markdown_and_symbols(text)
     pdf = FPDF()
     pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_loaded = False
     
     if os.path.exists(font_path):
-        pdf.add_font('DejaVu', '', font_path)
-        pdf.set_font('DejaVu', '', 11)
-    else:
+        try:
+            pdf.add_font('DejaVu', '', font_path)
+            pdf.set_font('DejaVu', '', 11)
+            font_loaded = True
+        except Exception as e:
+            logging.error(f"Font Load Error: {e}")
+            
+    if not font_loaded:
         pdf.set_font("Arial", size=11)
         
     lines = clean_text.strip().split('\n')
@@ -114,14 +128,14 @@ def create_pdf(text, filename):
             pdf.ln(4)
             continue
             
-        if not title_processed:
-            if os.path.exists(font_path): pdf.set_font('DejaVu', '', 14)
+        if not title_processed and len(c_line) < 100:
+            if font_loaded: pdf.set_font('DejaVu', '', 14)
             pdf.multi_cell(0, 8, c_line, align='C')
             title_processed = True
             pdf.ln(4)
         else:
-            if os.path.exists(font_path): pdf.set_font('DejaVu', '', 11)
-            pdf.multi_cell(0, 6, "    " + c_line, align='J')
+            if font_loaded: pdf.set_font('DejaVu', '', 11)
+            pdf.multi_cell(0, 6, c_line, align='J')
             
     pdf.output(filename)
 
@@ -138,7 +152,10 @@ async def transcribe_voice(file_id: str) -> str:
     wav_path = f"v_{file_id}.wav"
     try:
         await bot.download_file(file.file_path, ogg_path)
-        proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path, 
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
         await proc.communicate()
         return await asyncio.to_thread(recognize_audio, wav_path)
     except Exception as e:
@@ -148,13 +165,21 @@ async def transcribe_voice(file_id: str) -> str:
         for p in [ogg_path, wav_path]:
             if os.path.exists(p): os.remove(p)
 
+def do_ocr(photo_path):
+    """Оптимизированная обработка фото для OCR сканера"""
+    img = Image.open(photo_path).convert('L')  # Градации серого для четкости
+    try:
+        text = pytesseract.image_to_string(img, lang='rus+eng')
+    except Exception:
+        text = pytesseract.image_to_string(img)
+    return text.strip() if text else ""
+
 async def extract_text_from_photo(file_id: str) -> str:
     file = await bot.get_file(file_id)
     photo_path = f"photo_{file_id}.jpg"
     await bot.download_file(file.file_path, photo_path)
     try:
-        text = await asyncio.to_thread(pytesseract.image_to_string, Image.open(photo_path), lang='rus')
-        return text.strip() if text else ""
+        return await asyncio.to_thread(do_ocr, photo_path)
     except Exception as e:
         logging.error(f"OCR Error: {e}")
         return ""
@@ -320,7 +345,7 @@ async def handle_input(message: Message, state: FSMContext):
         elif message.photo:
             await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
             ocr_text = await extract_text_from_photo(message.photo[-1].file_id)
-            if not ocr_text or len(ocr_text) < 5:
+            if not ocr_text or len(ocr_text) < 3:
                 await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>\n\nПожалуйста, сфотографируйте документ ближе и при хорошем освещении.", reply_markup=get_back_kb(), parse_mode="HTML")
                 return
             input_text = f"Текст с фото документа:\n{ocr_text}"
@@ -328,7 +353,7 @@ async def handle_input(message: Message, state: FSMContext):
         elif message.document:
             await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
             pdf_text = await extract_text_from_pdf(message.document.file_id)
-            if not pdf_text or len(pdf_text) < 5:
+            if not pdf_text or len(pdf_text) < 3:
                 await status.edit_text("⚠️ <b>Не удалось извлечь текст из файла.</b>\n\nПопробуйте отправить документ как фото.", reply_markup=get_back_kb(), parse_mode="HTML")
                 return
             input_text = f"Текст из PDF-документа:\n{pdf_text}"
