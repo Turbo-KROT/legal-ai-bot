@@ -415,6 +415,8 @@ async def handle_input(message: Message, state: FSMContext):
         await status.edit_text("⚠️ Произошла ошибка при обработке запроса ИИ. Попробуйте повторить запрос.", reply_markup=get_back_kb())
 
 async def main():
+    # Автоматически сбрасываем любые зависшие вебхуки и конфликты
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
