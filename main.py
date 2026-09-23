@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import json
 import urllib.request
 import fitz
 from PIL import Image
@@ -26,10 +27,11 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# Используем более мощную модель GigaChat-3-Pro (или GigaChat-2-Pro)
 giga = GigaChat(
     credentials=GIGACHAT_CREDENTIALS,
     scope="GIGACHAT_API_PERS",
-    model="GigaChat-2",
+    model="GigaChat-2-Pro",
     verify_ssl_certs=False
 )
 
@@ -59,13 +61,17 @@ PROMPT_QA = """Ты — высококвалифицированный юрид�
 💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции, что делать дальше)
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
-PROMPT_DOC_GEN = """Ты — профессиональный юрист-делопроизводитель РФ. Твоя задача — составить текст юридического документа.
-ВНИМАНИЕ: Система автоматически превратит твой текст в PDF-файл. НИКОГДА не говори пользователю, что ты не можешь создать файл или PDF.
+PROMPT_DOC_GEN = """Ты — профессиональный юрист-делопроизводитель РФ.
+Твой ответ ДОЛЖЕН БЫТЬ СТРОГО в формате JSON без кавычек markdown:
+{
+  "action": "PDF" или "CHAT",
+  "text": "содержимое ответа"
+}
 
 ПРАВИЛА:
-1. Если пользователь просит образец, бланк, шаблон или прислал данные для заполнения — СОСТАВЬ ТЕКСТ ДОКУМЕНТА. В первой строке ответа ОБЯЗАТЕЛЬНО напиши кодовое слово: ДОКУМЕНТ_ГОТОВ. Со второй строки пиши сам документ.
-2. Если данных недостаточно и пользователь НЕ просит пустой образец — НАПИШИ ТЕКСТОМ, какие именно данные нужны (ФИО, адреса, суммы и т.д.). В этом случае НЕ пиши слово ДОКУМЕНТ_ГОТОВ.
-3. Текст самого документа начинай с Названия по центру. Без приветствий и лишних комментариев."""
+1. Если пользователь просит образец, бланк, шаблон, договор, заявление, или дал данные для заполнения — установи "action": "PDF". В поле "text" помести ТОЛЬКО готовый юридический документ (начиная с Названия по центру).
+2. Если тебе не хватает данных и пользователь НЕ просил пустой бланк — установи "action": "CHAT". В поле "text" напиши вежливый список вопросов/данных, которые нужно уточнить.
+НИКОГДА не пиши в поле "text", что ты не можешь создать PDF или файл."""
 
 # ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_user(user_id: int):
@@ -85,14 +91,12 @@ def sanitize_text_for_pdf(text: str) -> str:
     return text.strip()
 
 def download_font():
-    """Скачивает русский шрифт, если его нет, чтобы PDF никогда не ломался"""
     font_file = "DejaVuSans.ttf"
     if not os.path.exists(font_file):
         try:
             url = "https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf"
             urllib.request.urlretrieve(url, font_file)
-        except:
-            pass
+        except: pass
     return font_file if os.path.exists(font_file) else None
 
 def generate_pdf_file(text: str, filename: str) -> bool:
@@ -334,36 +338,61 @@ async def handle_input(message: Message, state: FSMContext):
             user["history"].append({"role": "assistant", "content": ans})
             await status.edit_text(ans + "\n\n<i>ℹ️ Информация носит справочный характер. Связь с юристом: /lawyer</i>", reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # РЕЖИМ ДОКУМЕНТОВ
+        # РЕЖИМ СОЗДАНИЯ ДОКУМЕНТА (JSON + ПРИНУДИТЕЛЬНЫЙ PDF-ФИЛЬТР)
         elif curr_state == BotStates.doc_gen_mode.state:
             user["history"].append({"role": "user", "content": input_text})
             if len(user["history"]) > 6: user["history"] = user["history"][-6:]
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user["history"]})
-            ans = res.choices[0].message.content
             
-            if "ДОКУМЕНТ_ГОТОВ" in ans:
-                clean_text = ans.replace("ДОКУМЕНТ_ГОТОВ", "").strip()
+            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user["history"]})
+            raw_ans = res.choices[0].message.content.strip()
+            
+            # Попытка разобрать JSON от нейросети
+            action = "CHAT"
+            out_text = raw_ans
+            
+            try:
+                # Очищаем возможные тройные кавычки markdown
+                json_str = re.sub(r'```json\s*|\s*```', '', raw_ans).strip()
+                data = json.loads(json_str)
+                action = data.get("action", "CHAT")
+                out_text = data.get("text", raw_ans)
+            except Exception:
+                # Если ИИ прислал не JSON, но пользователь явно просил файл/образец
+                keywords = ["образец", "дарственная", "европротокол", "договор", "бланк", "шаблон", "пришли pdf", "составь"]
+                if any(kw in input_text.lower() for kw in keywords):
+                    action = "PDF"
+                    out_text = raw_ans
+            
+            # СЧИТЫВАНИЕ РЕЗУЛЬТАТА:
+            if action == "PDF":
                 pdf_name = f"doc_{message.from_user.id}.pdf"
-                pdf_success = await asyncio.to_thread(generate_pdf_file, clean_text, pdf_name)
+                pdf_success = await asyncio.to_thread(generate_pdf_file, out_text, pdf_name)
                 await status.delete()
+                
                 if pdf_success and os.path.exists(pdf_name):
-                    await message.answer_document(FSInputFile(pdf_name), caption="📄 <b>Ваш документ готов.</b>", reply_markup=get_back_kb(), parse_mode="HTML")
+                    await message.answer_document(
+                        FSInputFile(pdf_name), 
+                        caption="📄 <b>Ваш проект документа готов.</b>", 
+                        reply_markup=get_back_kb(), 
+                        parse_mode="HTML"
+                    )
                     os.remove(pdf_name)
                 else:
-                    await message.answer(f"📄 <b>Документ готов:</b>\n\n{clean_text}", reply_markup=get_back_kb(), parse_mode="HTML")
+                    await message.answer(f"📄 <b>Ваш документ готов:</b>\n\n{out_text}", reply_markup=get_back_kb(), parse_mode="HTML")
             else:
-                user["history"].append({"role": "assistant", "content": ans})
-                await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
+                user["history"].append({"role": "assistant", "content": out_text})
+                await status.edit_text(out_text, reply_markup=get_back_kb(), parse_mode="HTML")
 
         # РЕЖИМ АНАЛИЗА
         elif curr_state == BotStates.doc_analyze_mode.state:
             sys_prompt = "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."
             res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]})
-            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{res.choices[0].message.content}", reply_markup=get_back_kb(), parse_mode="HTML")
+            ans = res.choices[0].message.content
+            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"AI Error: {e}")
-        await status.edit_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте сформулировать иначе.", reply_markup=get_back_kb())
+        await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформировать запрос иначе.", reply_markup=get_back_kb())
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
