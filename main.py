@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import sqlite3
-import urllib.request
 import fitz
 from PIL import Image
 import pytesseract
@@ -78,7 +77,6 @@ def set_db_city(user_id: int, city: str):
     conn.commit()
     conn.close()
 
-# Память истории диалога в рамках сессии
 user_history = {}
 
 # ============ ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ПАДЕНИЙ ============
@@ -106,9 +104,9 @@ PROMPT_QA = """Ты — высококвалифицированный юрид�
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
 PROMPT_DOC_GEN = """Ты — юридический делопроизводитель РФ.
+Твоя ЕДИНСТВЕННАЯ задача — составлять полные, юридически грамотные тексты документов.
 Если пользователь просит составить документ, прислать образец, бланк или дал данные — НАПИШИ ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА.
-Начинай сразу с Названия документа по центру (например, ДОГОВОР КУПЛИ-ПРОДАЖИ). Без приветствий и вводных фраз.
-Если данных не хватает и пользователь не просил пустой образец — задай уточняющие вопросы текстом."""
+Начинай сразу с Названия документа по центру (например, ДОГОВОР КУПЛИ-ПРОДАЖИ). Без приветствий, отговорок и лишних комментариев."""
 
 # ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def sanitize_text_for_pdf(text: str) -> str:
@@ -122,15 +120,6 @@ def sanitize_text_for_pdf(text: str) -> str:
         text = text.replace(orig, repl)
     return text.strip()
 
-def download_font():
-    font_file = "DejaVuSans.ttf"
-    if not os.path.exists(font_file):
-        try:
-            url = "https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf"
-            urllib.request.urlretrieve(url, font_file)
-        except: pass
-    return font_file if os.path.exists(font_file) else None
-
 def generate_pdf_file(text: str, filename: str) -> bool:
     try:
         clean_text = sanitize_text_for_pdf(text)
@@ -139,7 +128,13 @@ def generate_pdf_file(text: str, filename: str) -> bool:
         pdf.set_margins(20, 20, 10)
         pdf.set_auto_page_break(auto=True, margin=20)
         
-        font_path = download_font()
+        # Системные шрифты Ubuntu
+        font_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+        ]
+        font_path = next((f for f in font_candidates if os.path.exists(f)), None)
+        
         if font_path:
             pdf.add_font('DejaVu', '', font_path)
             pdf.set_font('DejaVu', '', 11)
@@ -167,7 +162,7 @@ def generate_pdf_file(text: str, filename: str) -> bool:
         pdf.output(filename)
         return True
     except Exception as e:
-        logging.error(f"PDF Build Error: {e}")
+        logging.error(f"PDF Build Error: {e}", exc_info=True)
         return False
 
 # ============ МЕДИА ============
@@ -395,7 +390,6 @@ async def handle_input(message: Message, state: FSMContext):
 
         # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (ПРИНУДИТЕЛЬНЫЙ СБОР В PDF)
         elif curr_state == BotStates.doc_gen_mode.state:
-            # Вырезаем «PDF» слова, чтобы Нейросеть не уходила в отказ
             clean_prompt_text = re.sub(r'(?i)\b(в\s+формате\s+)?(pdf|пдф|файл(ом)?|документ(ом)?|word|ворд)\b', '', input_text).strip()
             if len(clean_prompt_text) < 3: clean_prompt_text = input_text
 
@@ -405,11 +399,11 @@ async def handle_input(message: Message, state: FSMContext):
             res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user_history[user_id]})
             ans = res.choices[0].message.content.strip()
             
-            # Если ответ длинный (похож на документ) или пользователь просил текстом
+            # Если ответ длинный (похож на документ) или пользователь не просил явным образом "текстом в чат"
             is_explicit_text = "текстом" in input_text.lower() or "в чат" in input_text.lower()
-            is_document_body = len(ans) > 300 or "ДОГОВОР" in ans.upper() or "ЗАЯВЛЕНИЕ" in ans.upper() or "АКТ" in ans.upper()
             
-            if is_document_body and not is_explicit_text:
+            # Всякий раз, когда формируется текст документа, превращаем в PDF
+            if not is_explicit_text and len(ans) > 150:
                 pdf_name = f"doc_{message.from_user.id}.pdf"
                 pdf_success = await asyncio.to_thread(generate_pdf_file, ans, pdf_name)
                 
