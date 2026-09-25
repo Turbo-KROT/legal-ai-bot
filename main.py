@@ -34,11 +34,17 @@ giga = GigaChat(
     verify_ssl_certs=False
 )
 
-# ============ БАЗА ДАННЫХ ============
+# ============ БАЗА ДАННЫХ SQLITE ============
 def init_db():
     conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, accepted INTEGER DEFAULT 0, city TEXT DEFAULT NULL)")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            accepted INTEGER DEFAULT 0,
+            city TEXT DEFAULT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -46,31 +52,40 @@ init_db()
 
 def get_db_user(user_id: int):
     conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT accepted, city FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+    cursor = conn.cursor()
+    cursor.execute("SELECT accepted, city FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
     if not row:
-        conn = sqlite3.connect("users.db")
-        c2 = conn.cursor()
-        c2.execute("INSERT INTO users (user_id, accepted, city) VALUES (?, 0, NULL)", (user_id,))
+        cursor.execute("INSERT INTO users (user_id, accepted, city) VALUES (?, 0, NULL)", (user_id,))
         conn.commit()
-        conn.close()
-        return {"accepted": False, "city": None}
-    return {"accepted": bool(row[0]), "city": row[1]}
+        res = {"accepted": False, "city": None}
+    else:
+        res = {"accepted": bool(row[0]), "city": row[1]}
+    conn.close()
+    return res
 
-def update_db(user_id: int, field: str, value):
+def set_db_accept(user_id: int):
     conn = sqlite3.connect("users.db")
-    conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET accepted = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def set_db_city(user_id: int, city: str):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET city = ? WHERE user_id = ?", (city, user_id))
     conn.commit()
     conn.close()
 
 user_history = {}
 
+# ============ ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ПАДЕНИЙ ============
 @dp.errors()
 async def global_error_handler(event: ErrorEvent):
-    logging.critical(f"Ошибка подавлена: {event.exception}")
+    logging.critical(f"Критическая ошибка подавлена: {event.exception}")
 
+# ============ СОСТОЯНИЯ ============
 class BotStates(StatesGroup):
     waiting_for_city = State()
     main_menu = State()
@@ -93,56 +108,66 @@ PROMPT_QA = """Ты — высококвалифицированный юрид�
 💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции, что делать дальше)
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
-PROMPT_DOC_GEN = """Ты — юридический делопроизводитель РФ. Твоя задача — подготавливать тексты юридических документов.
+PROMPT_DOC_GEN = """Ты — высококвалифицированный юрист-делопроизводитель РФ.
+Твоя ЕДИНСТВЕННАЯ задача — составлять полные, юридически грамотные тексты документов.
+
 ВНИМАНИЕ! Если пользователь задает общий правовой вопрос, ответь ОДНИМ СЛОВОМ: REDIRECT_QA
 
-ПРАВИЛА:
-Ты обязан начинать ответ с тега [ЧАТ] или [ФАЙЛ].
-1. Если просят образец, шаблон, бланк или просят заполнить по данным: сгенерируй текст документа. Начни ответ с тега [ФАЙЛ]. Далее со следующей строки пиши текст документа (без "Вот ваш документ"). Если данных нет - ставь прочерки (___). Если клиент прислал текст образца и свои данные - аккуратно вставь данные в его текст.
-2. Если данных не хватает и нужно их запросить, начни ответ с тега [ЧАТ]. Далее напиши, какие данные нужны (ФИО, адреса и т.д.)."""
+СТРОГИЕ ПРАВИЛА:
+1. НИКОГДА НЕ ПИШИ, что ты не умеешь отправлять файлы, PDF или создавать документы.
+2. Когда пользователь просит образец, бланк, договор, заявление или прислал данные — СРАЗУ пиши полный текст юридического документа.
+3. Начинай ответ СРАЗУ с Названия документа по центру (например, ДОГОВОР КУПЛИ-ПРОДАЖИ). Без приветствий, отговорок и лишних комментариев.
+4. Если пользователь просит пустой образец — оставляй прочерки (________) в местах для данных."""
 
-# ============ ВЕРСТКА PDF (ГОСТ) ============
+# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def download_font():
     font_file = "DejaVuSans.ttf"
     if not os.path.exists(font_file):
         try:
-            urllib.request.urlretrieve("https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf", font_file)
-        except:
-            pass
+            url = "https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf"
+            urllib.request.urlretrieve(url, font_file)
+        except Exception as e:
+            logging.error(f"Font download error: {e}")
     return font_file if os.path.exists(font_file) else None
 
-def generate_pdf_gost(text: str, filename: str) -> bool:
+def sanitize_text_for_pdf(text: str) -> str:
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'#(.*?)\n', r'\1\n', text)
+    emoji_pattern = re.compile("[" "\U00010000-\U0010FFFF" "\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF" "]+", flags=re.UNICODE)
+    text = emoji_pattern.sub("", text)
+    replacements = {
+        '—': '-', '–': '-', '…': '...', '«': '"', '»': '"', 
+        '“': '"', '”': '"', '‘': "'", '’': "'", '\xa0': ' ', '\t': '    '
+    }
+    for orig, repl in replacements.items():
+        text = text.replace(orig, repl)
+    return text.strip()
+
+def generate_pdf_file(text: str, filename: str) -> bool:
     try:
-        clean_text = text.replace("[ФАЙЛ]", "").replace("[ЧАТ]", "").replace("===DOCUMENT_START===", "").strip()
-        clean_text = re.sub(r'\*\*(.*?)\*\*', r'\1', clean_text)
-        clean_text = re.sub(r'\*(.*?)\*', r'\1', clean_text)
-        clean_text = re.sub(r'#(.*?)\n', r'\1\n', clean_text)
-        
+        clean_text = sanitize_text_for_pdf(text)
         pdf = FPDF()
         pdf.add_page()
         pdf.set_margins(20, 20, 10)
         pdf.set_auto_page_break(auto=True, margin=20)
         
-        font_candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-        ]
-        font_path = next((f for f in font_candidates if os.path.exists(f)), download_font())
+        font_path = download_font()
+        if not font_path:
+            font_candidates = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+            ]
+            font_path = next((f for f in font_candidates if os.path.exists(f)), None)
         
         font_added = False
-        if font_path:
+        if font_path and os.path.exists(font_path):
             try:
                 pdf.add_font('DejaVu', '', font_path)
                 pdf.set_font('DejaVu', '', 11)
                 font_added = True
-            except Exception:
-                try:
-                    pdf.add_font('DejaVu', '', font_path, uni=True)
-                    pdf.set_font('DejaVu', '', 11)
-                    font_added = True
-                except Exception as fe:
-                    logging.error(f"Add font failed: {fe}")
+            except Exception as fe:
+                logging.error(f"Add font failed: {fe}")
 
         if not font_added:
             pdf.set_font("Arial", size=11)
@@ -157,7 +182,7 @@ def generate_pdf_gost(text: str, filename: str) -> bool:
                 continue
                 
             if not font_added:
-                c_line = c_line.encode('ascii', 'ignore').decode('ascii')
+                c_line = c_line.encode('latin-1', 'replace').decode('latin-1')
 
             if not title_done and len(c_line) < 120:
                 if font_added: pdf.set_font('DejaVu', '', 13)
@@ -174,39 +199,59 @@ def generate_pdf_gost(text: str, filename: str) -> bool:
         logging.error(f"PDF Build Error: {e}", exc_info=True)
         return False
 
-# ============ МЕДИА ОБРАБОТКА ============
+# ============ МЕДИА ============
 def recognize_audio(wav_path):
-    r = sr.Recognizer()
+    recognizer = sr.Recognizer()
     with sr.AudioFile(wav_path) as source:
-        return r.recognize_google(r.record(source), language="ru-RU")
+        audio_data = recognizer.record(source)
+        return recognizer.recognize_google(audio_data, language="ru-RU")
 
-async def process_media(message: Message):
-    if message.text:
-        return message.text
-    if message.voice:
-        f_id = message.voice.file_id
-        ogg, wav = f"v_{f_id}.ogg", f"v_{f_id}.wav"
-        await bot.download_file((await bot.get_file(f_id)).file_path, ogg)
-        proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+async def transcribe_voice(file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    ogg_path, wav_path = f"v_{file_id}.ogg", f"v_{file_id}.wav"
+    try:
+        await bot.download_file(file.file_path, ogg_path)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
         await proc.communicate()
-        res = await asyncio.to_thread(recognize_audio, wav)
-        for p in [ogg, wav]:
-            if os.path.exists(p):
-                os.remove(p)
-        return res
-    if message.photo:
-        p = f"p_{message.photo[-1].file_id}.jpg"
-        await bot.download_file((await bot.get_file(message.photo[-1].file_id)).file_path, p)
-        res = await asyncio.to_thread(pytesseract.image_to_string, Image.open(p).convert('L'), lang='rus+eng')
-        os.remove(p)
-        return res.strip()
-    if message.document:
-        d = f"d_{message.document.file_id}.pdf"
-        await bot.download_file((await bot.get_file(message.document.file_id)).file_path, d)
-        res = "".join([page.get_text() for page in fitz.open(d)])
-        os.remove(d)
-        return res.strip()
-    return ""
+        return await asyncio.to_thread(recognize_audio, wav_path)
+    except Exception as e:
+        logging.error(f"Voice Error: {e}")
+        return None
+    finally:
+        for p in [ogg_path, wav_path]:
+            if os.path.exists(p): os.remove(p)
+
+def process_ocr_photo(photo_path: str) -> str:
+    img = Image.open(photo_path).convert('L')
+    try: return pytesseract.image_to_string(img, lang='rus+eng').strip()
+    except: return pytesseract.image_to_string(img).strip()
+
+async def extract_text_from_photo(file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    photo_path = f"photo_{file_id}.jpg"
+    await bot.download_file(file.file_path, photo_path)
+    try: return await asyncio.to_thread(process_ocr_photo, photo_path)
+    except: return ""
+    finally:
+        if os.path.exists(photo_path): os.remove(photo_path)
+
+def process_pdf_extract(pdf_path: str) -> str:
+    text = ""
+    doc = fitz.open(pdf_path)
+    for page in doc: text += page.get_text()
+    return text.strip()
+
+async def extract_text_from_pdf(file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    pdf_path = f"doc_{file_id}.pdf"
+    await bot.download_file(file.file_path, pdf_path)
+    try: return await asyncio.to_thread(process_pdf_extract, pdf_path)
+    except: return ""
+    finally:
+        if os.path.exists(pdf_path): os.remove(pdf_path)
 
 # ============ КЛАВИАТУРЫ ============
 def agree_kb():
@@ -259,7 +304,7 @@ async def cmd_start(m: Message, state: FSMContext):
     await send_agreement(m)
 
 @dp.callback_query(F.data == "decline")
-async def decline(c: CallbackQuery):
+async def process_decline(c: CallbackQuery):
     await c.message.edit_text(
         "😔 Без принятия условий доступ к сервису ограничен. Вы можете передумать в любой момент:", 
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Вернуться к соглашению", callback_data="return_agree")]]),
@@ -274,8 +319,8 @@ async def ret_agree(c: CallbackQuery):
     await c.answer()
 
 @dp.callback_query(F.data == "accept")
-async def accept(c: CallbackQuery, state: FSMContext):
-    update_db(c.from_user.id, "accepted", 1)
+async def process_accept(c: CallbackQuery, state: FSMContext):
+    set_db_accept(c.from_user.id)
     await c.message.edit_text("✅ <b>Условия использования приняты.</b>", parse_mode="HTML")
     await c.message.answer(
         "🏙 <b>Укажите ваш город</b> (для учета региональных законов):", 
@@ -288,7 +333,7 @@ async def accept(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "skip_city")
 async def skip_city(c: CallbackQuery, state: FSMContext):
-    update_db(c.from_user.id, "city", "Не указан")
+    set_db_city(c.from_user.id, "Не указан")
     await c.message.delete()
     user_history[c.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
@@ -297,17 +342,21 @@ async def skip_city(c: CallbackQuery, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_city)
 async def city_in(m: Message, state: FSMContext):
-    update_db(m.from_user.id, "city", m.text.strip())
+    city_val = m.text.strip()
+    set_db_city(m.from_user.id, city_val)
     data = await state.get_data()
     if 'prompt_msg_id' in data:
         try:
             await bot.delete_message(m.chat.id, data['prompt_msg_id'])
         except Exception:
             pass
-    await m.delete()
+    try:
+        await m.delete()
+    except Exception:
+        pass
     user_history[m.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    await m.answer(f"📍 Ваш город: <b>{m.text.strip()}</b>\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    await m.answer(f"📍 Ваш город: <b>{city_val}</b>\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "change_city")
 async def ch_city(c: CallbackQuery, state: FSMContext):
@@ -320,7 +369,12 @@ async def ch_city(c: CallbackQuery, state: FSMContext):
 async def back_menu(c: CallbackQuery, state: FSMContext):
     user_history[c.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    await c.message.edit_text("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    # Сохраняем прошлый ответ и отправляем Главное меню новым сообщением!
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await c.message.answer("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data.startswith("mode_"))
@@ -350,98 +404,116 @@ async def modes(c: CallbackQuery, state: FSMContext):
 # ============ ЦЕНТРАЛЬНАЯ ЛОГИКА ОБРАБОТКИ ============
 @dp.message(F.text | F.voice | F.photo | F.document)
 async def handle(m: Message, state: FSMContext):
-    u = get_db_user(m.from_user.id)
+    user_id = m.from_user.id
+    user = get_db_user(user_id)
     curr = await state.get_state()
     
-    if not u["accepted"] or curr == BotStates.main_menu.state: 
+    if not user["accepted"] or curr == BotStates.main_menu.state: 
         return await m.answer("Пожалуйста, выберите раздел в меню 👇", reply_markup=main_kb())
 
     if curr == BotStates.prof_consult_mode.state:
         return await m.answer("<i>_ [⚠️в разработке🛠️]</i>", reply_markup=get_back_kb(), parse_mode="HTML")
 
     status = await m.answer("🔍 <i>Обрабатываю данные...</i>", parse_mode="HTML")
-    inp = await process_media(m)
     
-    if m.voice and inp: 
-        await status.edit_text(f"🎙 <b>Вы сказали:</b>\n«<i>{inp}</i>»\n\n🔍 <i>Анализирую...</i>", parse_mode="HTML")
-    
-    if not inp: 
-        return await status.edit_text("⚠️ Не удалось получить данные. Попробуйте еще раз.", reply_markup=get_back_kb())
-        
-    if m.caption: 
-        inp += f"\nДополнение от пользователя: {m.caption}"
-
-    uid = m.from_user.id
-    if uid not in user_history: 
-        user_history[uid] = {'h': [], 'rc': 0}
-    hist = user_history[uid]['h']
-
     try:
-        # 1. РЕЖИМ ВОПРОСА
+        caption = m.caption.strip() if m.caption else ""
+        input_text = ""
+        
+        if m.text:
+            input_text = m.text
+        elif m.voice:
+            await status.edit_text("🎙 <i>Распознаю голос...</i>", parse_mode="HTML")
+            input_text = await transcribe_voice(m.voice.file_id)
+            if input_text: await m.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
+        elif m.photo:
+            await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
+            ocr_text = await extract_text_from_photo(m.photo[-1].file_id)
+            if not ocr_text or len(ocr_text) < 3:
+                return await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>", reply_markup=get_back_kb(), parse_mode="HTML")
+            input_text = f"Текст с фото документа:\n{ocr_text}"
+            if caption: input_text += f"\n\nУказание пользователя: {caption}"
+        elif m.document:
+            await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
+            pdf_text = await extract_text_from_pdf(m.document.file_id)
+            if not pdf_text or len(pdf_text) < 3:
+                return await status.edit_text("⚠️ <b>Не удалось извлечь текст из файла.</b>", reply_markup=get_back_kb(), parse_mode="HTML")
+            input_text = f"Текст из PDF-документа:\n{pdf_text}"
+            if caption: input_text += f"\n\nУказание пользователя: {caption}"
+        
+        if not input_text:
+            return await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте повторить передачу.", reply_markup=get_back_kb())
+
+        if user_id not in user_history: user_history[user_id] = {'h': [], 'rc': 0}
+
+        # РЕЖИМ 1: ЮРИДИЧЕСКИЙ ВОПРОС
         if curr == BotStates.qa_mode.state:
-            hist.append({"role": "user", "content": inp})
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_QA + f"\nГород пользователя: {u['city']}"}] + hist[-6:]})
+            user_history[user_id]['h'].append({"role": "user", "content": input_text})
+            if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
+            
+            sys_prompt = PROMPT_QA + f"\nГород пользователя: {user['city']}"
+            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}] + user_history[user_id]['h']})
             ans = res.choices[0].message.content
             
             if "REDIRECT_DOC" in ans or "REDIRECT_ANALYZE" in ans:
-                user_history[uid]['rc'] += 1
+                user_history[user_id]['rc'] += 1
                 target = "mode_doc_gen" if "DOC" in ans else "mode_doc_analyze"
-                if user_history[uid]['rc'] > 2:
+                if user_history[user_id]['rc'] > 2:
                     return await status.edit_text("Вы задаете вопрос не по профилю раздела. Чтобы выбрать нужную функцию, нажмите «В главное меню».", reply_markup=get_back_kb())
                 return await status.edit_text("Данную функцию можно сделать, выбрав другой раздел. Нажмите кнопку ниже:", reply_markup=redirect_kb(target))
                 
-            hist.append({"role": "assistant", "content": ans})
+            user_history[user_id]['h'].append({"role": "assistant", "content": ans})
             footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для консультации обратитесь к юристу: /lawyer</i>"
             await status.edit_text(ans + footer, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # 2. РЕЖИМ СОЗДАНИЯ ДОКУМЕНТА
+        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (100% PDF ГЕНЕРАЦИЯ)
         elif curr == BotStates.doc_gen_mode.state:
-            clean_prompt_text = re.sub(r'(?i)\b(в\s+формате\s+)?(pdf|пдф|файл(ом)?|документ(ом)?|word|ворд)\b', '', inp).strip()
-            if len(clean_prompt_text) < 3: clean_prompt_text = inp
+            clean_prompt_text = re.sub(r'(?i)\b(в\s+формате\s+)?(pdf|пдф|файл(ом)?|документ(ом)?|word|ворд)\b', '', input_text).strip()
+            if len(clean_prompt_text) < 3: clean_prompt_text = input_text
 
-            hist.append({"role": "user", "content": clean_prompt_text})
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + hist[-6:]})
+            user_history[user_id]['h'].append({"role": "user", "content": clean_prompt_text})
+            if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
+            
+            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user_history[user_id]['h']})
             ans = res.choices[0].message.content.strip()
 
             if "REDIRECT_QA" in ans:
-                user_history[uid]['rc'] += 1
-                if user_history[uid]['rc'] > 2:
+                user_history[user_id]['rc'] += 1
+                if user_history[user_id]['rc'] > 2:
                     return await status.edit_text("Кажется, вы запутались. Для ответов на юридические вопросы выйдите в главное меню.", reply_markup=get_back_kb())
                 return await status.edit_text("Здесь я составляю документы. На этот правовой вопрос я могу ответить в разделе «Задать вопрос»:", reply_markup=redirect_kb("mode_qa"))
 
-            is_explicit_text = "текстом" in inp.lower() or "в чат" in inp.lower()
+            is_explicit_text = "текстом" in input_text.lower() or "в чат" in input_text.lower()
 
-            if "[ФАЙЛ]" in ans or len(ans) > 150:
-                if not is_explicit_text:
-                    f_name = f"doc_{uid}.pdf"
-                    pdf_success = await asyncio.to_thread(generate_pdf_gost, ans, f_name)
-                    
-                    await status.delete()
-                    if pdf_success and os.path.exists(f_name):
-                        await m.answer_document(FSInputFile(f_name), caption="📄 <b>Ваш проект документа готов (формат PDF).</b>", reply_markup=get_back_kb(), parse_mode="HTML")
-                        os.remove(f_name)
-                    else:
-                        await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{ans.replace('[ФАЙЛ]', '').replace('[ЧАТ]', '').strip()}", reply_markup=get_back_kb(), parse_mode="HTML")
+            if not is_explicit_text and len(ans) > 80:
+                pdf_name = f"doc_{user_id}.pdf"
+                pdf_success = await asyncio.to_thread(generate_pdf_file, ans, pdf_name)
+                
+                await status.delete()
+                if pdf_success and os.path.exists(pdf_name):
+                    await m.answer_document(
+                        FSInputFile(pdf_name), 
+                        caption="📄 <b>Ваш проект документа готов (формат PDF).</b>", 
+                        reply_markup=get_back_kb(), 
+                        parse_mode="HTML"
+                    )
+                    os.remove(pdf_name)
                 else:
-                    clean_ans = ans.replace("[ЧАТ]", "").replace("[ФАЙЛ]", "").strip()
-                    hist.append({"role": "assistant", "content": clean_ans})
-                    await status.edit_text(clean_ans, reply_markup=get_back_kb(), parse_mode="HTML")
+                    await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
             else:
-                clean_ans = ans.replace("[ЧАТ]", "").replace("[ФАЙЛ]", "").strip()
-                hist.append({"role": "assistant", "content": clean_ans})
-                await status.edit_text(clean_ans, reply_markup=get_back_kb(), parse_mode="HTML")
+                user_history[user_id]['h'].append({"role": "assistant", "content": ans})
+                await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # 3. РЕЖИМ РАЗБОРА ДОКУМЕНТА
-        elif curr_state == BotStates.doc_analyze_mode.state:
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."}] + [{"role": "user", "content": inp}]})
-            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{res.choices[0].message.content}", reply_markup=get_back_kb(), parse_mode="HTML")
+        # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА
+        elif curr == BotStates.doc_analyze_mode.state:
+            sys_prompt = "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."
+            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]})
+            ans = res.choices[0].message.content
+            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        try:
-            await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.", reply_markup=get_back_kb())
-        except Exception:
-            pass
+        logging.error(f"AI Error: {e}")
+        await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.", reply_markup=get_back_kb())
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
