@@ -108,41 +108,32 @@ PROMPT_QA = """Ты — высококвалифицированный юрид�
 💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции, что делать дальше)
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
-PROMPT_DOC_GEN = """Ты — профессиональный юрист-делопроизводитель РФ. Твоя задача — вести диалог по созданию юридических документов и подготавливать их тексты.
+PROMPT_DOC_GEN = """Ты — высококвалифицированный юрист-делопроизводитель РФ.
+Твоя ЕДИНСТВЕННАЯ задача — составлять полные, юридически грамотные тексты документов.
 
-АЛГОРИТМ И СТРОГИЕ ПРАВИЛА:
-1. Если пользователь просит "образец", "бланк", "шаблон", "дарственную", "договор купли-продажи" или пустой документ:
-   - В САМОМ НАЧАЛЕ ответа поставь метку [DOCUMENT_BODY].
-   - Со второй строки напиши ПОЛНЫЙ текст документа с прочерками (__________) в местах для реквизитов. Без приветствий и комментариев!
+ВНИМАНИЕ! Если пользователь задает общий правовой вопрос, ответь ОДНИМ СЛОВОМ: REDIRECT_QA
 
-2. Если пользователь просит заполнить документ по его данным или прислал фото/текст образца:
-   - Если данных НЕ ХВАТАЕТ: поставь метку [CHAT_RESPONSE] и вежливо перечисли списком, какие именно данные (ФИО, паспорта, адреса, даты, суммы) нужно прислать для заполнения.
-   - Если данные ПРЕДОСТАВЛЕНЫ: поставь метку [DOCUMENT_BODY] и напиши ПОЛНЫЙ ЗАПОЛНЕННЫЙ ТЕКСТ ДОКУМЕНТА со вставленными данными.
+СТРОГИЕ ПРАВИЛА:
+1. НИКОГДА НЕ ПИШИ, что ты не умеешь отправлять файлы, PDF или создавать документы.
+2. Когда пользователь просит образец, бланк, договор, заявление или прислал данные — СРАЗУ пиши полный текст юридического документа.
+3. Начинай ответ СРАЗУ с Названия документа по центру (например, ДОГОВОР КУПЛИ-ПРОДАЖИ). Без приветствий, отговорок и лишних комментариев.
+4. Если пользователь просит пустой образец — оставляй прочерки (________) в местах для данных."""
 
-3. Если пользователь просто описывает ситуацию:
-   - Поставь метку [CHAT_RESPONSE] и порекомендуй подходящий тип документа и предложи его составить.
-
-КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО говорить "я не могу отправлять файлы" или "используйте Word". Помни, что система сама создаст PDF-файл из метки [DOCUMENT_BODY]."""
-
-# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И PDF ============
 def download_font():
     font_file = "DejaVuSans.ttf"
     if not os.path.exists(font_file):
         try:
+            logging.info("Загрузка шрифта DejaVuSans.ttf...")
             urllib.request.urlretrieve("https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf", font_file)
         except Exception as e:
-            logging.error(f"Font download error: {e}")
+            logging.error(f"Ошибка загрузки шрифта: {e}")
     return font_file if os.path.exists(font_file) else None
 
 def sanitize_text_for_pdf(text: str) -> str:
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.*?)\*', r'\1', text)
-    text = re.sub(r'#(.*?)\n', r'\1\n', text)
-    text = text.replace("[DOCUMENT_BODY]", "").replace("[CHAT_RESPONSE]", "").strip()
-    
+    text = text.replace('**', '').replace('*', '').replace('#', '')
     emoji_pattern = re.compile("[" "\U00010000-\U0010FFFF" "\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF" "]+", flags=re.UNICODE)
     text = emoji_pattern.sub("", text)
-    
     replacements = {
         '—': '-', '–': '-', '…': '...', '«': '"', '»': '"', 
         '“': '"', '”': '"', '‘': "'", '’': "'", '\xa0': ' ', '\t': '    '
@@ -159,14 +150,10 @@ def generate_pdf_file(text: str, filename: str) -> bool:
         pdf.set_margins(20, 20, 10)
         pdf.set_auto_page_break(auto=True, margin=20)
         
-        font_path = download_font()
-        if not font_path:
-            font_candidates = [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-            ]
-            font_path = next((f for f in font_candidates if os.path.exists(f)), None)
-        
+        font_path = "DejaVuSans.ttf"
+        if not os.path.exists(font_path):
+            font_path = download_font()
+            
         font_added = False
         if font_path and os.path.exists(font_path):
             try:
@@ -376,11 +363,18 @@ async def ch_city(c: CallbackQuery, state: FSMContext):
 async def back_menu(c: CallbackQuery, state: FSMContext):
     user_history[c.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    try:
-        await c.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await c.message.answer("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    
+    msg_text = c.message.text or c.message.caption or ""
+    # Если это было техническое описание режима — заменяем его на Главное меню
+    if "РЕЖИМ:" in msg_text:
+        await c.message.edit_text("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    else:
+        # Если это готовый ответ или PDF — Сохраняем в истории и снизу открываем меню!
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await c.message.answer("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data.startswith("mode_"))
@@ -473,7 +467,7 @@ async def handle(m: Message, state: FSMContext):
             footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для консультации обратитесь к юристу: /lawyer</i>"
             await status.edit_text(ans + footer, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (ДВУХКОНТУРНАЯ ЛОГИКА)
+        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (ПРИНУДИТЕЛЬНЫЙ СБОР В PDF)
         elif curr == BotStates.doc_gen_mode.state:
             clean_prompt_text = re.sub(r'(?i)\b(в\s+формате\s+)?(pdf|пдф|файл(ом)?|документ(ом)?|word|ворд)\b', '', input_text).strip()
             if len(clean_prompt_text) < 3: clean_prompt_text = input_text
@@ -493,16 +487,12 @@ async def handle(m: Message, state: FSMContext):
 
             is_explicit_text = "текстом" in input_text.lower() or "в чат" in input_text.lower()
 
-            # Если ответ помечен тегом [DOCUMENT_BODY] или содержит заголовок документа
-            is_doc_body = "[DOCUMENT_BODY]" in ans or "ДОГОВОР" in ans.upper() or "ЗАЯВЛЕНИЕ" in ans.upper() or "АКТ" in ans.upper() or "ДАРСТВЕННАЯ" in ans.upper() or "СОГЛАШЕНИЕ" in ans.upper() or "ПРЕТЕНЗИЯ" in ans.upper() or "РАСПИСКА" in ans.upper()
-
-            if is_doc_body and not is_explicit_text:
-                clean_doc_text = ans.replace("[DOCUMENT_BODY]", "").replace("[CHAT_RESPONSE]", "").strip()
+            # Если ответ содержит юридический текст больше 100 символов — ДЕЛАЕМ PDF!
+            if not is_explicit_text and len(ans) > 100:
                 pdf_name = f"doc_{user_id}.pdf"
+                pdf_success = await asyncio.to_thread(generate_pdf_file, ans, pdf_name)
                 
-                pdf_success = await asyncio.to_thread(generate_pdf_file, clean_doc_text, pdf_name)
                 await status.delete()
-                
                 if pdf_success and os.path.exists(pdf_name):
                     await m.answer_document(
                         FSInputFile(pdf_name), 
@@ -512,11 +502,10 @@ async def handle(m: Message, state: FSMContext):
                     )
                     os.remove(pdf_name)
                 else:
-                    await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{clean_doc_text}", reply_markup=get_back_kb(), parse_mode="HTML")
+                    await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
             else:
-                clean_chat_text = ans.replace("[CHAT_RESPONSE]", "").replace("[DOCUMENT_BODY]", "").strip()
-                user_history[user_id]['h'].append({"role": "assistant", "content": clean_chat_text})
-                await status.edit_text(clean_chat_text, reply_markup=get_back_kb(), parse_mode="HTML")
+                user_history[user_id]['h'].append({"role": "assistant", "content": ans})
+                await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
 
         # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА
         elif curr == BotStates.doc_analyze_mode.state:
@@ -531,7 +520,7 @@ async def handle(m: Message, state: FSMContext):
         await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.", reply_markup=get_back_kb())
 
 async def main():
-    download_font()
+    download_font() # ВЫКАЧИВАЕТ ШРИФТ ПРИ СТАРТЕ СЕРВЕРА
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
