@@ -10,7 +10,7 @@ import pytesseract
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, 
+    Message, CallbackQuery, InlineKeyboardMarkup,
     InlineKeyboardButton, FSInputFile, ErrorEvent
 )
 from aiogram.fsm.context import FSMContext
@@ -94,6 +94,37 @@ class BotStates(StatesGroup):
     doc_analyze_mode = State()
     prof_consult_mode = State()
 
+# ============ KEYWORD-ПАТТЕРНЫ ДЛЯ ПРИНУДИТЕЛЬНОЙ ГЕНЕРАЦИИ PDF ============
+FORCE_PDF_PATTERNS = re.compile(
+    r"(?i)("
+    r"образец|бланк|шаблон|пример\s+документ|пример\s+договор|пример\s+заявлени|"
+    r"пришли\s+(документ|договор|заявлени|дарствен|доверенност|иск|претензи|контракт)|"
+    r"пришли\s+образец|пришли\s+бланк|пришли\s+шаблон|"
+    r"составь|составить|сформируй|сформировать|подготовь|подготовить|"
+    r"сделай\s+(документ|договор|заявлени|дарствен|доверенност|иск|претензи)|"
+    r"напиши\s+(документ|договор|заявлени|дарствен|доверенност|иск|претензи)|"
+    r"нужен\s+(договор|документ|бланк|образец|шаблон|заявлени|иск|претензи)|"
+    r"нужна\s+(дарствен|доверенност|расписка|жалоба|претензи)|"
+    r"хочу\s+(договор|документ|бланк|образец|дарствен|доверенност|иск|претензи)|"
+    r"договор\s+купли|договор\s+аренд|договор\s+займ|договор\s+подряд|"
+    r"трудовой\s+договор|договор\s+оказани|договор\s+поставк|"
+    r"дарственн|доверенност|исковое\s+заявлени|претензи|расписк|"
+    r"акт\s+приема|акт\s+выполнен|приказ\s+об|заявлени\s+на\s+(отпуск|увольнени|прием)"
+    r")"
+)
+
+REFUSAL_PATTERNS = re.compile(
+    r"(?i)("
+    r"не\s+могу\s+(отправ|создат|сгенерир|сформир|прислат|загруз)|"
+    r"не\s+имею\s+возможност.{0,20}(файл|pdf|документ)|"
+    r"являюсь\s+текстов|текстов\w+\s+модел|"
+    r"скопируйте\s+в\s+(word|ворд)|"
+    r"не\s+поддерживаю\s+(файл|pdf|формат)|"
+    r"обратитесь\s+к\s+юрист|"
+    r"я\s+не\s+в\s+состояни.{0,20}(создат|сформир|отправ)"
+    r")"
+)
+
 # ============ СИСТЕМНЫЕ ПРОМПТЫ ============
 PROMPT_QA = """Ты — высококвалифицированный юридический AI-консультант по ВСЕМ отраслям права РФ (Гражданское, Уголовное, Административное, Трудовое, Семейное, Налоговое, Земельное, а также ГПК, УПК, АПК, КАС, Конституция, Указы Президента и Постановления).
 Твоя цель — дать глубокую, понятную и практичную консультацию, опираясь на актуальное законодательство. Укажи четкий алгоритм действий.
@@ -108,87 +139,161 @@ PROMPT_QA = """Ты — высококвалифицированный юрид�
 💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции, что делать дальше)
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
-PROMPT_DOC_GEN = """Ты — высококвалифицированный юрист-делопроизводитель РФ.
-Твоя ЕДИНСТВЕННАЯ задача — составлять полные, юридически грамотные тексты документов.
+PROMPT_DOC_INTENT_DETECTOR = """Ты — классификатор намерений пользователя в системе генерации юридических документов.
 
-ВНИМАНИЕ! Если пользователь задает общий правовой вопрос, ответь ОДНИМ СЛОВОМ: REDIRECT_QA
+Проанализируй сообщение пользователя и ответь СТРОГО ОДНИМ СЛОВОМ из списка:
 
-СТРОГИЕ ПРАВИЛА:
-1. НИКОГДА НЕ ПИШИ, что ты не умеешь отправлять файлы, PDF или создавать документы.
-2. Когда пользователь просит образец, бланк, договор, заявление или прислал данные — СРАЗУ пиши полный текст юридического документа.
-3. Начинай ответ СРАЗУ с Названия документа по центру (например, ДОГОВОР КУПЛИ-ПРОДАЖИ). Без приветствий, отговорок и лишних комментариев.
-4. Если пользователь просит пустой образец — оставляй прочерки (________) в местах для данных."""
+NEED_PDF     — пользователь просит образец, бланк, шаблон, конкретный документ (договор, заявление, иск, доверенность, дарственную, расписку, акт и т.п.) или уже предоставил все данные для составления документа.
+NEED_CLARIFY — пользователь хочет документ, но не указал ключевые данные (стороны, предмет, условия) и нужно задать уточняющие вопросы перед составлением.
+NEED_TEXT    — пользователь явно просит ответить текстом в чат (написал "текстом", "в чат", "без PDF").
+REDIRECT_QA  — пользователь задаёт общий правовой вопрос, не связанный с составлением документа.
 
-# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И PDF ============
+ВАЖНО: отвечай ТОЛЬКО одним словом из списка выше. Никаких пояснений, никакого другого текста."""
+
+PROMPT_DOC_GENERATOR = """Ты — профессиональный юрист-делопроизводитель РФ. Твоя единственная задача — написать полный текст юридического документа.
+
+АБСОЛЮТНЫЕ ПРАВИЛА (нарушение недопустимо):
+1. Начинай СРАЗУ с названия документа (например: ДОГОВОР КУПЛИ-ПРОДАЖИ ТРАНСПОРТНОГО СРЕДСТВА). Без приветствий.
+2. ЗАПРЕЩЕНО писать фразы: "я не могу", "я не умею", "скопируйте в Word", "обратитесь к юристу", "как языковая модель", "как текстовый помощник".
+3. Если данные не указаны — используй прочерки __________ в полях для заполнения.
+4. Соблюдай структуру документа по стандартам РФ: название, дата, место, преамбула, предмет, права и обязанности, ответственность, реквизиты сторон.
+5. Пиши полный документ, не сокращай и не обрывай на середине.
+6. НИКАКИХ markdown-символов: никаких **, *, #, _, ~~. Только чистый текст."""
+
+PROMPT_DOC_CLARIFY = """Ты — профессиональный юрист-делопроизводитель РФ. Тебе нужно составить документ, но сначала уточни детали.
+
+Задай пользователю КОНКРЕТНЫЕ вопросы, необходимые для заполнения документа (ФИО сторон, паспортные данные, предмет договора, стоимость, сроки и т.п.).
+Спрашивай вежливо и по-деловому. Не пиши лишнего текста — только вопросы."""
+
+# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И PDF ============
 def download_font():
     font_file = "DejaVuSans.ttf"
     if not os.path.exists(font_file):
         try:
             logging.info("Загрузка шрифта DejaVuSans.ttf...")
-            urllib.request.urlretrieve("https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf", font_file)
+            urllib.request.urlretrieve(
+                "https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf",
+                font_file
+            )
         except Exception as e:
             logging.error(f"Ошибка загрузки шрифта: {e}")
     return font_file if os.path.exists(font_file) else None
 
 def sanitize_text_for_pdf(text: str) -> str:
-    text = text.replace('**', '').replace('*', '').replace('#', '')
-    emoji_pattern = re.compile("[" "\U00010000-\U0010FFFF" "\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF" "]+", flags=re.UNICODE)
+    text = text.replace('**', '').replace('*', '').replace('#', '').replace('_', ' ')
+    emoji_pattern = re.compile(
+        "["
+        "\U00010000-\U0010FFFF"
+        "\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF"
+        "]+",
+        flags=re.UNICODE
+    )
     text = emoji_pattern.sub("", text)
     replacements = {
-        '—': '-', '–': '-', '…': '...', '«': '"', '»': '"', 
-        '“': '"', '”': '"', '‘': "'", '’': "'", '\xa0': ' ', '\t': '    '
+        '\u2014': '-', '\u2013': '-', '\u2026': '...', '\u00AB': '"', '\u00BB': '"',
+        '\u201C': '"', '\u201D': '"', '\u2018': "'", '\u2019': "'",
+        '\u00A0': ' ', '\t': '    '
     }
     for orig, repl in replacements.items():
         text = text.replace(orig, repl)
     return text.strip()
+
+def is_title_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > 100:
+        return False
+    letters = [c for c in stripped if c.isalpha()]
+    if not letters:
+        return False
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    return upper_ratio >= 0.6
 
 def generate_pdf_file(text: str, filename: str) -> bool:
     try:
         clean_text = sanitize_text_for_pdf(text)
         pdf = FPDF()
         pdf.add_page()
-        pdf.set_margins(20, 20, 10)
+        pdf.set_margins(25, 20, 15)
         pdf.set_auto_page_break(auto=True, margin=20)
-        
+
         font_path = "DejaVuSans.ttf"
-        if not os.path.exists(font_path):
-            font_path = download_font()
-            
+        bold_font_path = "DejaVuSans-Bold.ttf"
+
         font_added = False
-        if font_path and os.path.exists(font_path):
+        bold_available = False
+
+        if os.path.exists(font_path):
             try:
                 pdf.add_font('DejaVu', '', font_path)
-                pdf.set_font('DejaVu', '', 11)
                 font_added = True
             except Exception as fe:
-                logging.error(f"Add font failed: {fe}")
+                logging.error(f"Add font (regular) failed: {fe}")
+
+        if font_added and os.path.exists(bold_font_path):
+            try:
+                pdf.add_font('DejaVu', 'B', bold_font_path)
+                bold_available = True
+            except Exception as fe:
+                logging.warning(f"Add font (bold) failed, will use regular: {fe}")
 
         if not font_added:
             pdf.set_font("Arial", size=11)
-            
+
         lines = clean_text.split('\n')
-        title_done = False
-        
-        for line in lines:
-            c_line = line.strip()
+        first_title_done = False
+
+        for raw_line in lines:
+            c_line = raw_line.strip()
+
             if not c_line:
-                pdf.ln(4)
+                pdf.ln(3)
                 continue
-                
+
             if not font_added:
                 c_line = c_line.encode('latin-1', 'replace').decode('latin-1')
 
-            if not title_done and len(c_line) < 120:
-                if font_added: pdf.set_font('DejaVu', '', 13)
+            if not first_title_done and is_title_line(c_line):
+                if font_added:
+                    pdf.set_font('DejaVu', 'B' if bold_available else '', 13)
+                else:
+                    pdf.set_font("Arial", 'B', 13)
+                pdf.multi_cell(0, 8, c_line, align='C')
+                pdf.ln(5)
+                first_title_done = True
+                if font_added:
+                    pdf.set_font('DejaVu', '', 11)
+                else:
+                    pdf.set_font("Arial", size=11)
+                continue
+
+            if first_title_done and is_title_line(c_line) and len(c_line) < 80:
+                pdf.ln(3)
+                if font_added:
+                    pdf.set_font('DejaVu', 'B' if bold_available else '', 11)
+                else:
+                    pdf.set_font("Arial", 'B', 11)
                 pdf.multi_cell(0, 7, c_line, align='C')
-                if font_added: pdf.set_font('DejaVu', '', 11)
-                pdf.ln(4)
-                title_done = True
-            else:
-                pdf.multi_cell(0, 6, "      " + c_line, align='J')
-                
+                pdf.ln(2)
+                if font_added:
+                    pdf.set_font('DejaVu', '', 11)
+                else:
+                    pdf.set_font("Arial", size=11)
+                continue
+
+            if re.match(r'^(\d+\.|г\.|«\d|\d{1,2}\.\d{2}\.\d{4})', c_line):
+                if font_added:
+                    pdf.set_font('DejaVu', '', 11)
+                pdf.multi_cell(0, 6, c_line, align='L')
+                continue
+
+            if font_added:
+                pdf.set_font('DejaVu', '', 11)
+            pdf.multi_cell(0, 6, "      " + c_line, align='J')
+
         pdf.output(filename)
+        logging.info(f"PDF успешно создан: {filename}")
         return True
+
     except Exception as e:
         logging.error(f"PDF Build Error: {e}", exc_info=True)
         return False
@@ -216,36 +321,46 @@ async def transcribe_voice(file_id: str) -> str:
         return None
     finally:
         for p in [ogg_path, wav_path]:
-            if os.path.exists(p): os.remove(p)
+            if os.path.exists(p):
+                os.remove(p)
 
 def process_ocr_photo(photo_path: str) -> str:
     img = Image.open(photo_path).convert('L')
-    try: return pytesseract.image_to_string(img, lang='rus+eng').strip()
-    except: return pytesseract.image_to_string(img).strip()
+    try:
+        return pytesseract.image_to_string(img, lang='rus+eng').strip()
+    except Exception:
+        return pytesseract.image_to_string(img).strip()
 
 async def extract_text_from_photo(file_id: str) -> str:
     file = await bot.get_file(file_id)
     photo_path = f"photo_{file_id}.jpg"
     await bot.download_file(file.file_path, photo_path)
-    try: return await asyncio.to_thread(process_ocr_photo, photo_path)
-    except: return ""
+    try:
+        return await asyncio.to_thread(process_ocr_photo, photo_path)
+    except Exception:
+        return ""
     finally:
-        if os.path.exists(photo_path): os.remove(photo_path)
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
 
 def process_pdf_extract(pdf_path: str) -> str:
     text = ""
     doc = fitz.open(pdf_path)
-    for page in doc: text += page.get_text()
+    for page in doc:
+        text += page.get_text()
     return text.strip()
 
 async def extract_text_from_pdf(file_id: str) -> str:
     file = await bot.get_file(file_id)
     pdf_path = f"doc_{file_id}.pdf"
     await bot.download_file(file.file_path, pdf_path)
-    try: return await asyncio.to_thread(process_pdf_extract, pdf_path)
-    except: return ""
+    try:
+        return await asyncio.to_thread(process_pdf_extract, pdf_path)
+    except Exception:
+        return ""
     finally:
-        if os.path.exists(pdf_path): os.remove(pdf_path)
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
 
 # ============ КЛАВИАТУРЫ ============
 def agree_kb():
@@ -264,10 +379,14 @@ def main_kb():
     ])
 
 def get_back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_menu")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_menu")
+    ]])
 
 def redirect_kb(m_type):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➡️ Перейти в нужный раздел", callback_data=m_type)]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➡️ Перейти в нужный раздел", callback_data=m_type)
+    ]])
 
 # ============ СТАРТ И ИНТЕРФЕЙС ============
 async def send_agreement(message_obj):
@@ -285,7 +404,11 @@ async def send_agreement(message_obj):
         await message_obj.answer_document(FSInputFile("faq.pdf"), caption="❓ Часто задаваемые вопросы (FAQ)")
     except Exception as e:
         logging.error(f"PDF Send Error: {e}")
-    await message_obj.answer("📋 <b>Условия использования сервиса</b>\n\nНажимая «Соглашаюсь», вы принимаете условия.", reply_markup=agree_kb(), parse_mode="HTML")
+    await message_obj.answer(
+        "📋 <b>Условия использования сервиса</b>\n\nНажимая «Соглашаюсь», вы принимаете условия.",
+        reply_markup=agree_kb(),
+        parse_mode="HTML"
+    )
 
 @dp.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
@@ -294,14 +417,20 @@ async def cmd_start(m: Message, state: FSMContext):
         await m.answer("👋 <b>С возвращением!</b>", parse_mode="HTML")
         user_history[m.from_user.id] = {'h': [], 'rc': 0}
         await state.set_state(BotStates.main_menu)
-        return await m.answer("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+        return await m.answer(
+            "📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):",
+            reply_markup=main_kb(),
+            parse_mode="HTML"
+        )
     await send_agreement(m)
 
 @dp.callback_query(F.data == "decline")
 async def process_decline(c: CallbackQuery):
     await c.message.edit_text(
-        "😔 Без принятия условий доступ к сервису ограничен. Вы можете передумать в любой момент:", 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Вернуться к соглашению", callback_data="return_agree")]]),
+        "😔 Без принятия условий доступ к сервису ограничен. Вы можете передумать в любой момент:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📄 Вернуться к соглашению", callback_data="return_agree")
+        ]]),
         parse_mode="HTML"
     )
     await c.answer()
@@ -317,8 +446,10 @@ async def process_accept(c: CallbackQuery, state: FSMContext):
     set_db_accept(c.from_user.id)
     await c.message.edit_text("✅ <b>Условия использования приняты.</b>", parse_mode="HTML")
     await c.message.answer(
-        "🏙 <b>Укажите ваш город</b> (для учета региональных законов):", 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚫 Не указывать (Пропустить)", callback_data="skip_city")]]), 
+        "🏙 <b>Укажите ваш город</b> (для учета региональных законов):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚫 Не указывать (Пропустить)", callback_data="skip_city")
+        ]]),
         parse_mode="HTML"
     )
     await state.set_state(BotStates.waiting_for_city)
@@ -331,7 +462,11 @@ async def skip_city(c: CallbackQuery, state: FSMContext):
     await c.message.delete()
     user_history[c.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    await c.message.answer("📍 Город не указан.\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    await c.message.answer(
+        "📍 Город не указан.\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):",
+        reply_markup=main_kb(),
+        parse_mode="HTML"
+    )
     await c.answer()
 
 @dp.message(BotStates.waiting_for_city)
@@ -350,7 +485,11 @@ async def city_in(m: Message, state: FSMContext):
         pass
     user_history[m.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    await m.answer(f"📍 Ваш город: <b>{city_val}</b>\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+    await m.answer(
+        f"📍 Ваш город: <b>{city_val}</b>\n\n📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):",
+        reply_markup=main_kb(),
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "change_city")
 async def ch_city(c: CallbackQuery, state: FSMContext):
@@ -363,43 +502,133 @@ async def ch_city(c: CallbackQuery, state: FSMContext):
 async def back_menu(c: CallbackQuery, state: FSMContext):
     user_history[c.from_user.id] = {'h': [], 'rc': 0}
     await state.set_state(BotStates.main_menu)
-    
+
     msg_text = c.message.text or c.message.caption or ""
-    # Если это было техническое описание режима — заменяем его на Главное меню
     if "РЕЖИМ:" in msg_text:
-        await c.message.edit_text("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+        await c.message.edit_text(
+            "📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):",
+            reply_markup=main_kb(),
+            parse_mode="HTML"
+        )
     else:
-        # Если это готовый ответ или PDF — Сохраняем в истории и снизу открываем меню!
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await c.message.answer("📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):", reply_markup=main_kb(), parse_mode="HTML")
+        await c.message.answer(
+            "📋 <b>ГЛАВНОЕ МЕНЮ</b>\n\nВыберите нужный раздел (доступен текст и голос 🎙):",
+            reply_markup=main_kb(),
+            parse_mode="HTML"
+        )
     await c.answer()
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def modes(c: CallbackQuery, state: FSMContext):
     if c.data == "mode_prof":
-        await c.message.edit_text("💼 <b>РЕЖИМ: Профильная консультация</b>\n\n<i>_ [⚠️в разработке🛠️]</i>", reply_markup=get_back_kb(), parse_mode="HTML")
+        await c.message.edit_text(
+            "💼 <b>РЕЖИМ: Профильная консультация</b>\n\n<i>_ [⚠️в разработке🛠️]</i>",
+            reply_markup=get_back_kb(),
+            parse_mode="HTML"
+        )
         await state.set_state(BotStates.prof_consult_mode)
         await c.answer()
         return
 
     modes_map = {
-        "mode_qa": BotStates.qa_mode, 
-        "mode_doc_gen": BotStates.doc_gen_mode, 
+        "mode_qa": BotStates.qa_mode,
+        "mode_doc_gen": BotStates.doc_gen_mode,
         "mode_doc_analyze": BotStates.doc_analyze_mode
     }
-    
+
     txt_map = {
         "mode_qa": "⚖️ <b>РЕЖИМ: Юридический вопрос</b>\n\nОпишите вашу ситуацию текстом или голосом 🎙.",
-        "mode_doc_gen": "📝 <b>РЕЖИМ: Создание документа</b>\n\nПришлите <b>фото или PDF</b> образца, либо напишите название документа. Я могу задать вопросы для заполнения или прислать готовый бланк.",
+        "mode_doc_gen": (
+            "📝 <b>РЕЖИМ: Создание документа</b>\n\n"
+            "Пришлите <b>фото или PDF</b> образца, либо напишите название документа.\n"
+            "Я могу задать вопросы для заполнения или прислать готовый бланк."
+        ),
         "mode_doc_analyze": "🔍 <b>РЕЖИМ: Разбор документа</b>\n\nПришлите <b>фото, PDF</b> или текст документа, и я найду в нем риски и ошибки."
     }
-    
+
     await state.set_state(modes_map[c.data])
     await c.message.edit_text(txt_map[c.data], reply_markup=get_back_kb(), parse_mode="HTML")
     await c.answer()
+
+# ============ ДВУХУРОВНЕВАЯ ЛОГИКА СОЗДАНИЯ ДОКУМЕНТОВ ============
+
+def keyword_forces_pdf(text: str) -> bool:
+    return bool(FORCE_PDF_PATTERNS.search(text))
+
+def response_is_refusal(text: str) -> bool:
+    return bool(REFUSAL_PATTERNS.search(text))
+
+async def classify_doc_intent(user_message: str) -> str:
+    if keyword_forces_pdf(user_message):
+        logging.info("Keyword-override: NEED_PDF (без вызова детектора)")
+        return "NEED_PDF"
+
+    if re.search(r"(?i)(текстом|в\s+чат|без\s+pdf|без\s+пдф)", user_message):
+        return "NEED_TEXT"
+
+    try:
+        res = await asyncio.to_thread(
+            giga.chat,
+            {
+                "messages": [
+                    {"role": "system", "content": PROMPT_DOC_INTENT_DETECTOR},
+                    {"role": "user", "content": user_message}
+                ]
+            }
+        )
+        raw = res.choices[0].message.content.strip().upper()
+        first_word = raw.split()[0] if raw.split() else ""
+        valid = {"NEED_PDF", "NEED_CLARIFY", "NEED_TEXT", "REDIRECT_QA"}
+        if first_word in valid:
+            logging.info(f"Детектор намерений вернул: {first_word}")
+            return first_word
+        else:
+            logging.warning(f"Детектор вернул неожиданный ответ: '{raw}' — используем NEED_PDF")
+            return "NEED_PDF"
+    except Exception as e:
+        logging.error(f"Intent detector error: {e}")
+        return "NEED_PDF"
+
+async def generate_document_text(user_request: str, history: list) -> str:
+    messages = [{"role": "system", "content": PROMPT_DOC_GENERATOR}]
+    if history:
+        messages.extend(history[-4:])
+    messages.append({"role": "user", "content": user_request})
+
+    try:
+        res = await asyncio.to_thread(giga.chat, {"messages": messages})
+        text = res.choices[0].message.content.strip()
+        text = text.replace('**', '').replace('*', '').replace('#', '')
+
+        if response_is_refusal(text):
+            logging.warning("Генератор документа вернул отказ — игнорируем ответ модели")
+            return ""
+        return text
+    except Exception as e:
+        logging.error(f"Document generator error: {e}")
+        return ""
+
+async def get_clarify_questions(user_request: str, doc_type_hint: str = "") -> str:
+    hint = f"Тип документа: {doc_type_hint}\n" if doc_type_hint else ""
+    try:
+        res = await asyncio.to_thread(
+            giga.chat,
+            {
+                "messages": [
+                    {"role": "system", "content": PROMPT_DOC_CLARIFY},
+                    {"role": "user", "content": f"{hint}Запрос пользователя: {user_request}"}
+                ]
+            }
+        )
+        text = res.choices[0].message.content.strip()
+        return text.replace('**', '').replace('*', '')
+    except Exception as e:
+        logging.error(f"Clarify questions error: {e}")
+        return "Уточните, пожалуйста: кто является сторонами договора, каков предмет и основные условия?"
 
 # ============ ЦЕНТРАЛЬНАЯ ЛОГИКА ОБРАБОТКИ ============
 @dp.message(F.text | F.voice | F.photo | F.document)
@@ -407,120 +636,223 @@ async def handle(m: Message, state: FSMContext):
     user_id = m.from_user.id
     user = get_db_user(user_id)
     curr = await state.get_state()
-    
-    if not user["accepted"] or curr == BotStates.main_menu.state: 
+
+    if not user["accepted"] or curr == BotStates.main_menu.state:
         return await m.answer("Пожалуйста, выберите раздел в меню 👇", reply_markup=main_kb())
 
     if curr == BotStates.prof_consult_mode.state:
         return await m.answer("<i>_ [⚠️в разработке🛠️]</i>", reply_markup=get_back_kb(), parse_mode="HTML")
 
     status = await m.answer("🔍 <i>Обрабатываю данные...</i>", parse_mode="HTML")
-    
+
     try:
         caption = m.caption.strip() if m.caption else ""
         input_text = ""
-        
+
         if m.text:
             input_text = m.text
         elif m.voice:
             await status.edit_text("🎙 <i>Распознаю голос...</i>", parse_mode="HTML")
             input_text = await transcribe_voice(m.voice.file_id)
-            if input_text: await m.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
+            if input_text:
+                await m.answer(f"🎙 <b>Вы сказали:</b>\n«<i>{input_text}</i>»", parse_mode="HTML")
         elif m.photo:
             await status.edit_text("📸 <i>Сканирую текст с фото...</i>", parse_mode="HTML")
             ocr_text = await extract_text_from_photo(m.photo[-1].file_id)
             if not ocr_text or len(ocr_text) < 3:
-                return await status.edit_text("⚠️ <b>Не удалось четко распознать текст с фото.</b>", reply_markup=get_back_kb(), parse_mode="HTML")
+                return await status.edit_text(
+                    "⚠️ <b>Не удалось четко распознать текст с фото.</b>",
+                    reply_markup=get_back_kb(), parse_mode="HTML"
+                )
             input_text = f"Текст с фото документа:\n{ocr_text}"
-            if caption: input_text += f"\n\nУказание пользователя: {caption}"
+            if caption:
+                input_text += f"\n\nУказание пользователя: {caption}"
         elif m.document:
             await status.edit_text("📄 <i>Читаю PDF-файл...</i>", parse_mode="HTML")
             pdf_text = await extract_text_from_pdf(m.document.file_id)
             if not pdf_text or len(pdf_text) < 3:
-                return await status.edit_text("⚠️ <b>Не удалось извлечь текст из файла.</b>", reply_markup=get_back_kb(), parse_mode="HTML")
+                return await status.edit_text(
+                    "⚠️ <b>Не удалось извлечь текст из файла.</b>",
+                    reply_markup=get_back_kb(), parse_mode="HTML"
+                )
             input_text = f"Текст из PDF-документа:\n{pdf_text}"
-            if caption: input_text += f"\n\nУказание пользователя: {caption}"
-        
+            if caption:
+                input_text += f"\n\nУказание пользователя: {caption}"
+
         if not input_text:
-            return await status.edit_text("⚠️ Не удалось разобрать данные. Попробуйте повторить передачу.", reply_markup=get_back_kb())
+            return await status.edit_text(
+                "⚠️ Не удалось разобрать данные. Попробуйте повторить передачу.",
+                reply_markup=get_back_kb()
+            )
 
-        if user_id not in user_history: user_history[user_id] = {'h': [], 'rc': 0}
+        if user_id not in user_history:
+            user_history[user_id] = {'h': [], 'rc': 0}
 
+        # ================================================================
         # РЕЖИМ 1: ЮРИДИЧЕСКИЙ ВОПРОС
+        # ================================================================
         if curr == BotStates.qa_mode.state:
             user_history[user_id]['h'].append({"role": "user", "content": input_text})
-            if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
-            
+            if len(user_history[user_id]['h']) > 6:
+                user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
+
             sys_prompt = PROMPT_QA + f"\nГород пользователя: {user['city']}"
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}] + user_history[user_id]['h']})
+            res = await asyncio.to_thread(
+                giga.chat,
+                {"messages": [{"role": "system", "content": sys_prompt}] + user_history[user_id]['h']}
+            )
             ans = res.choices[0].message.content
             ans = ans.replace('**', '').replace('*', '')
-            
+
             if "REDIRECT_DOC" in ans or "REDIRECT_ANALYZE" in ans:
                 user_history[user_id]['rc'] += 1
                 target = "mode_doc_gen" if "DOC" in ans else "mode_doc_analyze"
                 if user_history[user_id]['rc'] > 2:
-                    return await status.edit_text("Вы задаете вопрос не по профилю раздела. Чтобы выбрать нужную функцию, нажмите «В главное меню».", reply_markup=get_back_kb())
-                return await status.edit_text("Данную функцию можно сделать, выбрав другой раздел. Нажмите кнопку ниже:", reply_markup=redirect_kb(target))
-                
+                    return await status.edit_text(
+                        "Вы задаете вопрос не по профилю раздела. Чтобы выбрать нужную функцию, нажмите «В главное меню».",
+                        reply_markup=get_back_kb()
+                    )
+                return await status.edit_text(
+                    "Данную функцию можно сделать, выбрав другой раздел. Нажмите кнопку ниже:",
+                    reply_markup=redirect_kb(target)
+                )
+
             user_history[user_id]['h'].append({"role": "assistant", "content": ans})
             footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для консультации обратитесь к юристу: /lawyer</i>"
             await status.edit_text(ans + footer, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (ПРИНУДИТЕЛЬНЫЙ СБОР В PDF)
+        # ================================================================
+        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА — ДВУХУРОВНЕВАЯ АРХИТЕКТУРА
+        # ================================================================
         elif curr == BotStates.doc_gen_mode.state:
-            clean_prompt_text = re.sub(r'(?i)\b(в\s+формате\s+)?(pdf|пдф|файл(ом)?|документ(ом)?|word|ворд)\b', '', input_text).strip()
-            if len(clean_prompt_text) < 3: clean_prompt_text = input_text
 
-            user_history[user_id]['h'].append({"role": "user", "content": clean_prompt_text})
-            if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
-            
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user_history[user_id]['h']})
-            ans = res.choices[0].message.content.strip()
-            ans = ans.replace('**', '').replace('*', '')
+            await status.edit_text("📋 <i>Анализирую запрос...</i>", parse_mode="HTML")
 
-            if "REDIRECT_QA" in ans:
+            intent = await classify_doc_intent(input_text)
+            logging.info(f"[doc_gen] user={user_id} intent={intent} input='{input_text[:80]}'")
+
+            if intent == "REDIRECT_QA":
                 user_history[user_id]['rc'] += 1
                 if user_history[user_id]['rc'] > 2:
-                    return await status.edit_text("Кажется, вы запутались. Для ответов на юридические вопросы выйдите в главное меню.", reply_markup=get_back_kb())
-                return await status.edit_text("Здесь я составляю документы. На этот правовой вопрос я могу ответить в разделе «Задать вопрос»:", reply_markup=redirect_kb("mode_qa"))
+                    return await status.edit_text(
+                        "Кажется, вы задаёте правовой вопрос. На него я отвечу в разделе «Задать вопрос» — выйдите в главное меню.",
+                        reply_markup=get_back_kb()
+                    )
+                return await status.edit_text(
+                    "Здесь я составляю документы. На этот правовой вопрос я могу ответить в другом разделе:",
+                    reply_markup=redirect_kb("mode_qa")
+                )
 
-            is_explicit_text = "текстом" in input_text.lower() or "в чат" in input_text.lower()
+            if intent == "NEED_CLARIFY":
+                await status.edit_text("💬 <i>Уточняю детали...</i>", parse_mode="HTML")
+                clarify_text = await get_clarify_questions(input_text)
+                user_history[user_id]['h'].append({"role": "user", "content": input_text})
+                user_history[user_id]['h'].append({"role": "assistant", "content": clarify_text})
+                if len(user_history[user_id]['h']) > 8:
+                    user_history[user_id]['h'] = user_history[user_id]['h'][-8:]
+                return await status.edit_text(
+                    f"📝 {clarify_text}",
+                    reply_markup=get_back_kb(),
+                    parse_mode="HTML"
+                )
 
-            # Если ответ содержит юридический текст больше 100 символов — ДЕЛАЕМ PDF!
-            if not is_explicit_text and len(ans) > 100:
-                pdf_name = f"doc_{user_id}.pdf"
-                pdf_success = await asyncio.to_thread(generate_pdf_file, ans, pdf_name)
-                
+            if intent == "NEED_TEXT":
+                await status.edit_text("✍️ <i>Составляю документ...</i>", parse_mode="HTML")
+                doc_text = await generate_document_text(input_text, user_history[user_id]['h'])
+                if not doc_text:
+                    doc_text = "⚠️ Не удалось составить документ. Попробуйте уточнить запрос."
+                user_history[user_id]['h'].append({"role": "user", "content": input_text})
+                user_history[user_id]['h'].append({"role": "assistant", "content": doc_text})
+                if len(user_history[user_id]['h']) > 8:
+                    user_history[user_id]['h'] = user_history[user_id]['h'][-8:]
+                return await status.edit_text(doc_text, reply_markup=get_back_kb(), parse_mode="HTML")
+
+            # NEED_PDF — основной путь
+            await status.edit_text("⚙️ <i>Составляю документ...</i>", parse_mode="HTML")
+            doc_text = await generate_document_text(input_text, user_history[user_id]['h'])
+
+            if not doc_text:
+                logging.warning(f"[doc_gen] Первый вызов генератора вернул пустой текст, повторяем с усиленным промптом")
+                fallback_request = (
+                    f"Составь полный текст документа: {input_text}\n"
+                    "Начни сразу с названия документа. Используй прочерки для незаполненных полей."
+                )
+                doc_text = await generate_document_text(fallback_request, [])
+
+            if not doc_text or len(doc_text) < 50:
                 await status.delete()
-                if pdf_success and os.path.exists(pdf_name):
+                return await m.answer(
+                    "⚠️ Не удалось составить документ. Пожалуйста, уточните: какой именно документ вам нужен и между какими сторонами?",
+                    reply_markup=get_back_kb(),
+                    parse_mode="HTML"
+                )
+
+            await status.edit_text("📄 <i>Формирую PDF-файл...</i>", parse_mode="HTML")
+            pdf_name = f"doc_{user_id}.pdf"
+            pdf_success = await asyncio.to_thread(generate_pdf_file, doc_text, pdf_name)
+
+            await status.delete()
+
+            if pdf_success and os.path.exists(pdf_name):
+                try:
                     await m.answer_document(
-                        FSInputFile(pdf_name), 
-                        caption="📄 <b>Ваш проект документа готов (формат PDF).</b>", 
-                        reply_markup=get_back_kb(), 
+                        FSInputFile(pdf_name),
+                        caption="📄 <b>Ваш проект документа готов (формат PDF).</b>\n\n<i>Документ сформирован по стандартам РФ. При необходимости обратитесь к юристу для заверения.</i>",
+                        reply_markup=get_back_kb(),
                         parse_mode="HTML"
                     )
-                    os.remove(pdf_name)
-                else:
-                    await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
+                finally:
+                    if os.path.exists(pdf_name):
+                        os.remove(pdf_name)
             else:
-                user_history[user_id]['h'].append({"role": "assistant", "content": ans})
-                await status.edit_text(ans, reply_markup=get_back_kb(), parse_mode="HTML")
+                logging.error(f"[doc_gen] PDF generation failed for user={user_id}, отправляем текст")
+                await m.answer(
+                    f"📄 <b>Ваш документ готов (текстовый формат):</b>\n\n{doc_text[:4000]}",
+                    reply_markup=get_back_kb(),
+                    parse_mode="HTML"
+                )
 
+            user_history[user_id]['h'].append({"role": "user", "content": input_text})
+            user_history[user_id]['h'].append({
+                "role": "assistant",
+                "content": "[Документ составлен и отправлен пользователю в формате PDF]"
+            })
+            if len(user_history[user_id]['h']) > 8:
+                user_history[user_id]['h'] = user_history[user_id]['h'][-8:]
+
+        # ================================================================
         # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА
+        # ================================================================
         elif curr == BotStates.doc_analyze_mode.state:
-            sys_prompt = "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."
-            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}] + [{"role": "user", "content": input_text}]})
+            sys_prompt = (
+                "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. "
+                "Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. "
+                "Выдай понятный и подробный отчет со ссылками на законы."
+            )
+            res = await asyncio.to_thread(
+                giga.chat,
+                {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]}
+            )
             ans = res.choices[0].message.content
             ans = ans.replace('**', '').replace('*', '')
-            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
+            await status.edit_text(
+                f"🔍 <b>Результат правового анализа:</b>\n\n{ans}",
+                reply_markup=get_back_kb(),
+                parse_mode="HTML"
+            )
 
     except Exception as e:
-        logging.error(f"AI Error: {e}")
-        await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.", reply_markup=get_back_kb())
+        logging.error(f"AI Error: {e}", exc_info=True)
+        try:
+            await status.edit_text(
+                "⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.",
+                reply_markup=get_back_kb()
+            )
+        except Exception:
+            pass
 
 async def main():
-    download_font() # ВЫКАЧИВАЕТ ШРИФТ ПРИ СТАРТЕ СЕРВЕРА
+    download_font()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
