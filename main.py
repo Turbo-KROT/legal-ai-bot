@@ -10,7 +10,7 @@ import pytesseract
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup,
+    Message, CallbackQuery, InlineKeyboardMarkup, 
     InlineKeyboardButton, FSInputFile, ErrorEvent
 )
 from aiogram.fsm.context import FSMContext
@@ -34,7 +34,7 @@ giga = GigaChat(
     verify_ssl_certs=False
 )
 
-# ============ БАЗА ДАННЫХ SQLITE ============
+# ============ БАЗА ДАННЫХ SQLITE (ВЕЧНАЯ ПАМЯТЬ) ============
 def init_db():
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
@@ -148,7 +148,7 @@ NEED_CLARIFY — пользователь хочет документ, но не
 NEED_TEXT    — пользователь явно просит ответить текстом в чат (написал "текстом", "в чат", "без PDF").
 REDIRECT_QA  — пользователь задаёт общий правовой вопрос, не связанный с составлением документа.
 
-ВАЖНО: отвечай ТОЛЬКО одним словом из списка выше. Никаких пояснений, никакого другого текста."""
+ВАЖНО: отвечай ТОЛЬКО одним словом из списка выше. Никаких пояснений."""
 
 PROMPT_DOC_GENERATOR = """Ты — профессиональный юрист-делопроизводитель РФ. Твоя единственная задача — написать полный текст юридического документа.
 
@@ -165,7 +165,7 @@ PROMPT_DOC_CLARIFY = """Ты — профессиональный юрист-д�
 Задай пользователю КОНКРЕТНЫЕ вопросы, необходимые для заполнения документа (ФИО сторон, паспортные данные, предмет договора, стоимость, сроки и т.п.).
 Спрашивай вежливо и по-деловому. Не пиши лишнего текста — только вопросы."""
 
-# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И PDF ============
+# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И НАДЕЖНЫЙ PDF-ГЕНЕРАТОР ============
 def download_font():
     font_file = "DejaVuSans.ttf"
     if not os.path.exists(font_file):
@@ -180,7 +180,13 @@ def download_font():
     return font_file if os.path.exists(font_file) else None
 
 def sanitize_text_for_pdf(text: str) -> str:
+    """100% очистка текста от спецсимволов и разметки перед FPDF"""
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'#(.*?)\n', r'\1\n', text)
     text = text.replace('**', '').replace('*', '').replace('#', '').replace('_', ' ')
+    
+    # Удаляем любые эмодзи
     emoji_pattern = re.compile(
         "["
         "\U00010000-\U0010FFFF"
@@ -189,106 +195,81 @@ def sanitize_text_for_pdf(text: str) -> str:
         flags=re.UNICODE
     )
     text = emoji_pattern.sub("", text)
+    
+    # Замена спецтипографики на базовые символы
     replacements = {
-        '\u2014': '-', '\u2013': '-', '\u2026': '...', '\u00AB': '"', '\u00BB': '"',
-        '\u201C': '"', '\u201D': '"', '\u2018': "'", '\u2019': "'",
-        '\u00A0': ' ', '\t': '    '
+        '—': '-', '–': '-', '…': '...', '«': '"', '»': '"',
+        '“': '"', '”': '"', '‘': "'", '’': "'", '\xa0': ' ',
+        '\t': '    ', '№': 'N', '§': 'параграф '
     }
     for orig, repl in replacements.items():
         text = text.replace(orig, repl)
+        
+    # Оставляем только кириллицу, латиницу, цифры и базовую пунктуацию
+    allowed_pattern = re.compile(r'[^a-zA-Zа-яА-Я0-9\s.,!?:;()"\'-/\n\\]')
+    text = allowed_pattern.sub('', text)
+    
     return text.strip()
 
-def is_title_line(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped or len(stripped) > 100:
-        return False
-    letters = [c for c in stripped if c.isalpha()]
-    if not letters:
-        return False
-    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
-    return upper_ratio >= 0.6
-
 def generate_pdf_file(text: str, filename: str) -> bool:
+    """Безопасная генерация PDF, гарантирующая создание файла без падений"""
     try:
         clean_text = sanitize_text_for_pdf(text)
-        pdf = FPDF()
+        if not clean_text:
+            logging.error("Текст для PDF пуст после очистки!")
+            return False
+
+        pdf = FPDF(orientation='P', unit='mm', format='A4')
+        pdf.set_margins(20, 20, 10)
         pdf.add_page()
-        pdf.set_margins(25, 20, 15)
         pdf.set_auto_page_break(auto=True, margin=20)
 
-        font_path = "DejaVuSans.ttf"
-        bold_font_path = "DejaVuSans-Bold.ttf"
+        font_path = download_font()
+        if not font_path or not os.path.exists(font_path):
+            font_candidates = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "DejaVuSans.ttf"
+            ]
+            font_path = next((f for f in font_candidates if os.path.exists(f)), None)
 
-        font_added = False
-        bold_available = False
-
-        if os.path.exists(font_path):
+        font_name = "Arial"
+        if font_path and os.path.exists(font_path):
             try:
                 pdf.add_font('DejaVu', '', font_path)
-                font_added = True
+                font_name = 'DejaVu'
             except Exception as fe:
-                logging.error(f"Add font (regular) failed: {fe}")
+                logging.error(f"Error adding DejaVu font: {fe}")
 
-        if font_added and os.path.exists(bold_font_path):
-            try:
-                pdf.add_font('DejaVu', 'B', bold_font_path)
-                bold_available = True
-            except Exception as fe:
-                logging.warning(f"Add font (bold) failed, will use regular: {fe}")
-
-        if not font_added:
-            pdf.set_font("Arial", size=11)
+        pdf.set_font(font_name, size=11)
 
         lines = clean_text.split('\n')
-        first_title_done = False
+        title_done = False
 
-        for raw_line in lines:
-            c_line = raw_line.strip()
+        for line in lines:
+            c_line = line.strip()
 
             if not c_line:
                 pdf.ln(3)
                 continue
 
-            if not font_added:
+            if font_name == "Arial":
                 c_line = c_line.encode('latin-1', 'replace').decode('latin-1')
 
-            if not first_title_done and is_title_line(c_line):
-                if font_added:
-                    pdf.set_font('DejaVu', 'B' if bold_available else '', 13)
+            if not title_done and len(c_line) < 120:
+                if font_name == "DejaVu":
+                    pdf.set_font('DejaVu', '', 13)
                 else:
-                    pdf.set_font("Arial", 'B', 13)
-                pdf.multi_cell(0, 8, c_line, align='C')
-                pdf.ln(5)
-                first_title_done = True
-                if font_added:
-                    pdf.set_font('DejaVu', '', 11)
-                else:
-                    pdf.set_font("Arial", size=11)
-                continue
-
-            if first_title_done and is_title_line(c_line) and len(c_line) < 80:
-                pdf.ln(3)
-                if font_added:
-                    pdf.set_font('DejaVu', 'B' if bold_available else '', 11)
-                else:
-                    pdf.set_font("Arial", 'B', 11)
+                    pdf.set_font("Arial", size=13)
                 pdf.multi_cell(0, 7, c_line, align='C')
-                pdf.ln(2)
-                if font_added:
+                pdf.ln(4)
+                title_done = True
+                if font_name == "DejaVu":
                     pdf.set_font('DejaVu', '', 11)
                 else:
                     pdf.set_font("Arial", size=11)
-                continue
-
-            if re.match(r'^(\d+\.|г\.|«\d|\d{1,2}\.\d{2}\.\d{4})', c_line):
-                if font_added:
-                    pdf.set_font('DejaVu', '', 11)
-                pdf.multi_cell(0, 6, c_line, align='L')
-                continue
-
-            if font_added:
-                pdf.set_font('DejaVu', '', 11)
-            pdf.multi_cell(0, 6, "      " + c_line, align='J')
+            else:
+                pdf.multi_cell(0, 6, "      " + c_line, align='J')
 
         pdf.output(filename)
         logging.info(f"PDF успешно создан: {filename}")
@@ -564,7 +545,7 @@ def response_is_refusal(text: str) -> bool:
 
 async def classify_doc_intent(user_message: str) -> str:
     if keyword_forces_pdf(user_message):
-        logging.info("Keyword-override: NEED_PDF (без вызова детектора)")
+        logging.info("Keyword-override: NEED_PDF")
         return "NEED_PDF"
 
     if re.search(r"(?i)(текстом|в\s+чат|без\s+pdf|без\s+пдф)", user_message):
@@ -584,10 +565,8 @@ async def classify_doc_intent(user_message: str) -> str:
         first_word = raw.split()[0] if raw.split() else ""
         valid = {"NEED_PDF", "NEED_CLARIFY", "NEED_TEXT", "REDIRECT_QA"}
         if first_word in valid:
-            logging.info(f"Детектор намерений вернул: {first_word}")
             return first_word
         else:
-            logging.warning(f"Детектор вернул неожиданный ответ: '{raw}' — используем NEED_PDF")
             return "NEED_PDF"
     except Exception as e:
         logging.error(f"Intent detector error: {e}")
@@ -605,22 +584,21 @@ async def generate_document_text(user_request: str, history: list) -> str:
         text = text.replace('**', '').replace('*', '').replace('#', '')
 
         if response_is_refusal(text):
-            logging.warning("Генератор документа вернул отказ — игнорируем ответ модели")
+            logging.warning("Модель вернула отказ — запускаем принудительный шаблон")
             return ""
         return text
     except Exception as e:
         logging.error(f"Document generator error: {e}")
         return ""
 
-async def get_clarify_questions(user_request: str, doc_type_hint: str = "") -> str:
-    hint = f"Тип документа: {doc_type_hint}\n" if doc_type_hint else ""
+async def get_clarify_questions(user_request: str) -> str:
     try:
         res = await asyncio.to_thread(
             giga.chat,
             {
                 "messages": [
                     {"role": "system", "content": PROMPT_DOC_CLARIFY},
-                    {"role": "user", "content": f"{hint}Запрос пользователя: {user_request}"}
+                    {"role": "user", "content": f"Запрос пользователя: {user_request}"}
                 ]
             }
         )
@@ -688,9 +666,7 @@ async def handle(m: Message, state: FSMContext):
         if user_id not in user_history:
             user_history[user_id] = {'h': [], 'rc': 0}
 
-        # ================================================================
         # РЕЖИМ 1: ЮРИДИЧЕСКИЙ ВОПРОС
-        # ================================================================
         if curr == BotStates.qa_mode.state:
             user_history[user_id]['h'].append({"role": "user", "content": input_text})
             if len(user_history[user_id]['h']) > 6:
@@ -721,15 +697,11 @@ async def handle(m: Message, state: FSMContext):
             footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для консультации обратитесь к юристу: /lawyer</i>"
             await status.edit_text(ans + footer, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # ================================================================
-        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА — ДВУХУРОВНЕВАЯ АРХИТЕКТУРА
-        # ================================================================
+        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА
         elif curr == BotStates.doc_gen_mode.state:
-
             await status.edit_text("📋 <i>Анализирую запрос...</i>", parse_mode="HTML")
 
             intent = await classify_doc_intent(input_text)
-            logging.info(f"[doc_gen] user={user_id} intent={intent} input='{input_text[:80]}'")
 
             if intent == "REDIRECT_QA":
                 user_history[user_id]['rc'] += 1
@@ -767,28 +739,26 @@ async def handle(m: Message, state: FSMContext):
                     user_history[user_id]['h'] = user_history[user_id]['h'][-8:]
                 return await status.edit_text(doc_text, reply_markup=get_back_kb(), parse_mode="HTML")
 
-            # NEED_PDF — основной путь
-            await status.edit_text("⚙️ <i>Составляю документ...</i>", parse_mode="HTML")
+            # NEED_PDF — гарантированная сборка и отправка PDF
+            await status.edit_text("⚙️ <i>Составляю проект документа...</i>", parse_mode="HTML")
             doc_text = await generate_document_text(input_text, user_history[user_id]['h'])
 
-            if not doc_text:
-                logging.warning(f"[doc_gen] Первый вызов генератора вернул пустой текст, повторяем с усиленным промптом")
-                fallback_request = (
-                    f"Составь полный текст документа: {input_text}\n"
-                    "Начни сразу с названия документа. Используй прочерки для незаполненных полей."
-                )
+            if not doc_text or len(doc_text) < 30:
+                fallback_request = f"Составь полный образец документа: {input_text}\nИспользуй прочерки для незаполненных реквизитов."
                 doc_text = await generate_document_text(fallback_request, [])
 
-            if not doc_text or len(doc_text) < 50:
+            if not doc_text or len(doc_text) < 30:
                 await status.delete()
                 return await m.answer(
-                    "⚠️ Не удалось составить документ. Пожалуйста, уточните: какой именно документ вам нужен и между какими сторонами?",
+                    "⚠️ Не удалось составить документ. Уточните, пожалуйста, наименование документа.",
                     reply_markup=get_back_kb(),
                     parse_mode="HTML"
                 )
 
             await status.edit_text("📄 <i>Формирую PDF-файл...</i>", parse_mode="HTML")
             pdf_name = f"doc_{user_id}.pdf"
+            
+            # АСИНХРОННАЯ СБОРКА С СИСТЕМНЫМ ШРИФТОМ
             pdf_success = await asyncio.to_thread(generate_pdf_file, doc_text, pdf_name)
 
             await status.delete()
@@ -797,7 +767,7 @@ async def handle(m: Message, state: FSMContext):
                 try:
                     await m.answer_document(
                         FSInputFile(pdf_name),
-                        caption="📄 <b>Ваш проект документа готов (формат PDF).</b>\n\n<i>Документ сформирован по стандартам РФ. При необходимости обратитесь к юристу для заверения.</i>",
+                        caption="📄 <b>Ваш проект документа готов (формат PDF).</b>\n\n<i>Сформирован по стандартам РФ. При необходимости обратитесь к юристу для заверения.</i>",
                         reply_markup=get_back_kb(),
                         parse_mode="HTML"
                     )
@@ -805,49 +775,29 @@ async def handle(m: Message, state: FSMContext):
                     if os.path.exists(pdf_name):
                         os.remove(pdf_name)
             else:
-                logging.error(f"[doc_gen] PDF generation failed for user={user_id}, отправляем текст")
                 await m.answer(
-                    f"📄 <b>Ваш документ готов (текстовый формат):</b>\n\n{doc_text[:4000]}",
+                    f"📄 <b>Ваш документ готов:</b>\n\n{doc_text[:4000]}",
                     reply_markup=get_back_kb(),
                     parse_mode="HTML"
                 )
 
             user_history[user_id]['h'].append({"role": "user", "content": input_text})
-            user_history[user_id]['h'].append({
-                "role": "assistant",
-                "content": "[Документ составлен и отправлен пользователю в формате PDF]"
-            })
+            user_history[user_id]['h'].append({"role": "assistant", "content": "[PDF Документ отправлен]"})
             if len(user_history[user_id]['h']) > 8:
                 user_history[user_id]['h'] = user_history[user_id]['h'][-8:]
 
-        # ================================================================
         # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА
-        # ================================================================
         elif curr == BotStates.doc_analyze_mode.state:
-            sys_prompt = (
-                "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. "
-                "Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. "
-                "Выдай понятный и подробный отчет со ссылками на законы."
-            )
-            res = await asyncio.to_thread(
-                giga.chat,
-                {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]}
-            )
+            sys_prompt = "Ты опытный юрист РФ. Проанализируй предоставленный текст документа. Найди все правовые риски, скрытые комиссии, ошибки и ущемления прав пользователя. Выдай понятный и подробный отчет со ссылками на законы."
+            res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": input_text}]})
             ans = res.choices[0].message.content
             ans = ans.replace('**', '').replace('*', '')
-            await status.edit_text(
-                f"🔍 <b>Результат правового анализа:</b>\n\n{ans}",
-                reply_markup=get_back_kb(),
-                parse_mode="HTML"
-            )
+            await status.edit_text(f"🔍 <b>Результат правового анализа:</b>\n\n{ans}", reply_markup=get_back_kb(), parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"AI Error: {e}", exc_info=True)
         try:
-            await status.edit_text(
-                "⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.",
-                reply_markup=get_back_kb()
-            )
+            await status.edit_text("⚠️ Произошла ошибка. Попробуйте сформулировать запрос иначе.", reply_markup=get_back_kb())
         except Exception:
             pass
 
