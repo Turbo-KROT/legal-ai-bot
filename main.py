@@ -5,6 +5,7 @@ import re
 import sqlite3
 import urllib.request
 import fitz
+from pathlib import Path
 from PIL import Image
 import pytesseract
 from aiogram import Bot, Dispatcher, F
@@ -34,7 +35,7 @@ giga = GigaChat(
     verify_ssl_certs=False
 )
 
-# ============ БАЗА ДАННЫХ SQLITE ============
+# ============ БАЗА ДАННЫХ SQLITE (ВЕЧНАЯ ПАМЯТЬ) ============
 def init_db():
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
@@ -95,7 +96,7 @@ class BotStates(StatesGroup):
     prof_consult_mode = State()
 
 # ============ СИСТЕМНЫЕ ПРОМПТЫ ============
-PROMPT_QA_FIRST = """Ты — высококвалифицированный юридический AI-консультант по ВСЕМ отраслям права РФ (Гражданское, Уголовное, Административное, Трудовое, Семейное, Налоговое, Земельное, а также ГПК, УПК, АПК, КАС, Конституция, Указы Президента и Постановления).
+PROMPT_QA = """Ты — высококвалифицированный юридический AI-консультант по ВСЕМ отраслям права РФ (Гражданское, Уголовное, Административное, Трудовое, Семейное, Налоговое, Земельное, а также ГПК, УПК, АПК, КАС, Конституция, Указы Президента и Постановления).
 Твоя цель — дать глубокую, понятную и практичную консультацию, опираясь на актуальное законодательство. Укажи четкий алгоритм действий.
 
 ВНИМАНИЕ! Если пользователь просит СОСТАВИТЬ документ или бланк, ответь ОДНИМ СЛОВОМ: REDIRECT_DOC
@@ -108,41 +109,44 @@ PROMPT_QA_FIRST = """Ты — высококвалифицированный ю�
 💡 ПЛАН ДЕЙСТВИЙ: (Конкретные, пошаговые инструкции, что делать дальше)
 ⚠️ РИСКИ И СРОКИ: (Сроки давности, возможные подводные камни)"""
 
-PROMPT_QA_FOLLOWUP = """Ты — юридический AI-консультант РФ. Это УТОЧНЯЮЩИЙ вопрос от пользователя в рамках текущей консультации.
-Отвечай как опытный живой юрист — понятным, профессиональным человеческим языком.
-НЕ ИСПОЛЬЗУЙ жесткие шаблоны с заголовками (📌, 📖, 💡). Отвечай прямо на заданный уточняющий вопрос по существу."""
+PROMPT_DOC_GEN = """Ты — юридический делопроизводитель РФ. Твоя задача — подготавливать тексты юридических документов или вести диалог по их заполнению.
 
-PROMPT_DOC_GEN = """Ты — официальный юрист-делопроизводитель РФ. Твоя задача — подготавливать полные тексты юридических документов.
+ПРАВИЛА И ТЕГИ:
+1. Если просят образец, бланк, шаблон, договор, европротокол, дарственную или прислали данные для заполнения:
+   - Составь ПОЛНЫЙ текст документа.
+   - В САМОМ НАЧАЛЕ ответа поставь метку [ФАЙЛ].
+   - Если данные не указаны — используй ровную линию из нижних подчеркиваний: _______________________
+   - НЕ ИСПОЛЬЗУЙ таблицы с вертикальными чертами |---|---|!
 
-СТРОГИЕ ПРАВИЛА:
-1. Если пользователь просит образец, бланк, шаблон, договор, дарственную, европротокол или пустой документ — СРАЗУ СОСТАВЬ ПОЛНЫЙ ТЕКСТ ДОКУМЕНТА.
-2. В местах для реквизитов ОБЯЗАТЕЛЬНО используй сплошные линии из нижних подчеркиваний: _______________________
-3. НЕ ЗАДАВАЙ уточняющих вопросов, если пользователь попросил образец или пустой бланк!
-4. Начинай ответ СРАЗУ с Названия документа заглавными буквами по центру (например, ДОГОВОР ДАРЕНИЯ). Без приветствий и вводных фраз."""
+2. Если пользователь прислал шаблон или данных не хватает для формирования документа:
+   - В САМОМ НАЧАЛЕ ответа поставь метку [ЧАТ].
+   - Задай понятные, конкретные вопросы: какие именно данные (ФИО, паспорта, адреса, суммы) нужны для заполнения."""
 
-PROMPT_DOC_CLARIFY = """Ты — юрист-делопроизводитель. Пользователь просит заполнить документ по его данным, но данных не хватает.
-Задай пользователю вежливый и четкий список вопросов, какие именно данные (ФИО, паспорта, адреса, даты, суммы) нужны для заполнения."""
+PROMPT_ANALYZE = """Ты — объективный, опытный и адекватный юрист-консультант РФ. 
+Твоя задача — профессиональный разбор документов и живой диалог с клиентом.
 
-PROMPT_ANALYZE = """Ты — объективный и адекватный юрист-аудитор РФ. 
-Внимательно изучи присланный текст документа и дай ОБЪЕКТИВНУЮ оценку:
+ПРАВИЛА АНАЛИЗА:
+1. Подчеркни ГРАМОТНЫЕ и ХОРОШИЕ пункты договора.
+2. Найди СУЩЕСТВЕННЫЕ и РЕАЛЬНЫЕ риски.
+3. Если риск незначительный или стандартный — успокой клиента, объясни простыми словами, что в целом договор составлен нормально и переживать не стоит.
+4. Введи диалог естественно. Отвечай на простые вопросы клиента ("В целом хорошо?", "Я влетел?") понятным и понятным языком, помня контекст разбираемого документа."""
 
-1. Если в документе есть ОПАСНЫЕ РИСКИ или ущемления прав — НАЧНИ СРАЗУ С НИХ. Выдели их первоочередно. Хорошие стороны упомяни лишь в конце.
-2. Если документ ХОРОШИЙ и стандартный — подмети его грамотные стороны, а в конце укажи мелкие формальные нюансы (если они есть) и успокой клиента, что договор нормальный.
-3. На уточняющие вопросы пользователя по документу отвечай понятным человеческим языком, сохраняя контекст разбираемого дела."""
-
-# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И PDF ============
-def download_font():
+# ============ НАДЕЖНЫЙ PDF-ДВИЖОК ============
+def download_font() -> str | None:
     font_file = "DejaVuSans.ttf"
-    if not os.path.exists(font_file):
+    abs_font = str((Path.cwd() / font_file).resolve())
+    if not os.path.exists(abs_font):
         try:
-            urllib.request.urlretrieve("https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf", font_file)
+            logging.info("[PDF] Загрузка шрифта DejaVuSans.ttf...")
+            urllib.request.urlretrieve("https://github.com/matomo-org/travis-scripts/raw/master/fonts/DejaVuSans.ttf", abs_font)
         except Exception as e:
-            logging.error(f"Font download error: {e}")
-    return font_file if os.path.exists(font_file) else None
+            logging.error(f"[PDF] Ошибка загрузки шрифта: {e}")
+    return abs_font if os.path.exists(abs_font) else None
 
 def clean_text_chat(text: str) -> str:
     text = text.replace('**', '').replace('*', '').replace('###', '').replace('##', '').replace('#', '')
-    return text.strip()
+    text = text.replace('[ЧАТ]', '').replace('[ФАЙЛ]', '').strip()
+    return text
 
 def sanitize_text_for_pdf(text: str) -> str:
     text = clean_text_chat(text)
@@ -163,12 +167,16 @@ def sanitize_text_for_pdf(text: str) -> str:
     text = allowed_pattern.sub('', text)
     return text.strip()
 
-def generate_pdf_gost(text: str, filename: str) -> bool:
+def generate_pdf_file(text: str, filename: str) -> bool:
+    abs_pdf_path = str((Path.cwd() / filename).resolve())
+    logging.info(f"[PDF] Начало сборки: {abs_pdf_path}")
     try:
         clean_text = sanitize_text_for_pdf(text)
-        if not clean_text: return False
+        if not clean_text or len(clean_text) < 20:
+            logging.error("[PDF] Текст слишком короткий или пустой")
+            return False
         
-        pdf = FPDF()
+        pdf = FPDF(orientation='P', unit='mm', format='A4')
         pdf.add_page()
         pdf.set_margins(20, 20, 10)
         pdf.set_auto_page_break(auto=True, margin=20)
@@ -177,8 +185,7 @@ def generate_pdf_gost(text: str, filename: str) -> bool:
         if not font_path or not os.path.exists(font_path):
             font_candidates = [
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                "DejaVuSans.ttf"
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
             ]
             font_path = next((f for f in font_candidates if os.path.exists(f)), None)
         
@@ -189,7 +196,7 @@ def generate_pdf_gost(text: str, filename: str) -> bool:
                 pdf.set_font('DejaVu', '', 11)
                 font_added = True
             except Exception as fe:
-                logging.error(f"Add font failed: {fe}")
+                logging.error(f"[PDF] Ошибка прикрепления шрифта: {fe}")
 
         if not font_added:
             pdf.set_font("Arial", size=11)
@@ -215,10 +222,13 @@ def generate_pdf_gost(text: str, filename: str) -> bool:
             else:
                 pdf.multi_cell(0, 6, "      " + c_line, align='J')
                 
-        pdf.output(filename)
-        return True
+        pdf.output(abs_pdf_path)
+        exists = os.path.exists(abs_pdf_path)
+        size = os.path.getsize(abs_pdf_path) if exists else 0
+        logging.info(f"[PDF] Сборка завершена: exists={exists}, size={size} bytes")
+        return exists and size > 100
     except Exception as e:
-        logging.error(f"PDF Build Error: {e}", exc_info=True)
+        logging.error(f"[PDF] Исключение при сборке: {e}", exc_info=True)
         return False
 
 # ============ МЕДИА ОБРАБОТЧИКИ ============
@@ -270,7 +280,7 @@ async def extract_text_from_pdf(file_id: str) -> str:
     file = await bot.get_file(file_id)
     pdf_path = f"doc_{file_id}.pdf"
     await bot.download_file(file.file_path, pdf_path)
-    try: return await asyncio.to_thread(process_pdf_extract, pdf_path)
+    try: return await asyncio-to_thread(process_pdf_extract, pdf_path)
     except: return ""
     finally:
         if os.path.exists(pdf_path): os.remove(pdf_path)
@@ -498,11 +508,10 @@ async def handle(m: Message, state: FSMContext):
 
         if user_id not in user_history: user_history[user_id] = {'h': [], 'rc': 0, 'doc_text': ""}
 
-        # РЕЖИМ 1: ЮРИДИЧЕСКИЙ ВОПРОС
+        # РЕЖИМ 1: ВОПРОСЫ (Первый по структуре, дальше гибкий разговор)
         if curr == BotStates.qa_mode.state:
-            # Разделяем первый вопрос и уточняющие вопросы
-            is_first_question = len(user_history[user_id]['h']) == 0
-            sys_p = PROMPT_QA_FIRST if is_first_question else PROMPT_QA_FOLLOWUP
+            is_first = len(user_history[user_id]['h']) == 0
+            sys_p = PROMPT_QA_FIRST if is_first else PROMPT_QA_FOLLOWUP
             
             user_history[user_id]['h'].append({"role": "user", "content": input_text})
             if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
@@ -518,17 +527,14 @@ async def handle(m: Message, state: FSMContext):
                 return await status.edit_text("Данную функцию можно сделать, выбрав другой раздел. Нажмите кнопку ниже:", reply_markup=redirect_kb(target))
                 
             user_history[user_id]['h'].append({"role": "assistant", "content": ans})
-            footer = "\n\n<i>ℹ️ Информация носит справочный характер. Для консультации обратитесь к юристу: /lawyer</i>"
+            footer = "\n\n<i>ℹ️ Информация носит справочный характер. Связь с юристом: /lawyer</i>" if is_first else ""
             await status.edit_text(ans + footer, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА
+        # РЕЖИМ 2: СОЗДАНИЕ ДОКУМЕНТА (100% PDF ДВИЖОК БЕЗ ФОЛБЕКА)
         elif curr == BotStates.doc_gen_mode.state:
             user_history[user_id]['h'].append({"role": "user", "content": input_text})
             if len(user_history[user_id]['h']) > 6: user_history[user_id]['h'] = user_history[user_id]['h'][-6:]
             
-            # Проверяем, дал ли клиент конкретные данные для заполнения
-            has_filled_data = any(w in input_text.lower() for w in ['фио', 'паспорт', 'проживающий', 'рублей', 'заполнить', 'данные', 'иванов', 'петров'])
-
             res = await asyncio.to_thread(giga.chat, {"messages": [{"role": "system", "content": PROMPT_DOC_GEN}] + user_history[user_id]['h']})
             ans = res.choices[0].message.content.strip()
 
@@ -536,34 +542,45 @@ async def handle(m: Message, state: FSMContext):
                 user_history[user_id]['rc'] += 1
                 if user_history[user_id]['rc'] > 2:
                     return await status.edit_text("Для ответов на вопросы выйдите в главное меню.", reply_markup=get_back_kb())
-                return await status.edit_text("На этот вопрос я отвечу в разделе «Задать вопрос»:", reply_markup=redirect_kb("mode_qa"))
+                return await status.edit_text("Здесь я составляю документы. На этот вопрос отвечу в другом разделе:", reply_markup=redirect_kb("mode_qa"))
 
             is_explicit_text = "текстом" in input_text.lower() or "в чат" in input_text.lower()
+            has_filled_data = any(w in input_text.lower() for w in ['фио', 'паспорт', 'проживающий', 'рублей', 'заполнить', 'данные', 'иванов', 'петров'])
 
-            # ПРИНУДИТЕЛЬНАЯ ГЕНЕРАЦИЯ PDF ПРИ ЗАПРОСЕ ОБРАЗЦА ИЛИ ДАННЫХ
-            if not is_explicit_text:
-                pdf_name = f"doc_{user_id}.pdf"
-                pdf_success = await asyncio.to_thread(generate_pdf_gost, ans, pdf_name)
-                
-                await status.delete()
-                if pdf_success and os.path.exists(pdf_name):
-                    caption_txt = "📄 <b>Заполненный документ готов (PDF).</b>" if has_filled_data else "📄 <b>Ваш проект бланка готов (PDF).</b>"
-                    await m.answer_document(
-                        FSInputFile(pdf_name), 
-                        caption=caption_txt, 
-                        reply_markup=doc_ready_kb(is_filled=has_filled_data), 
-                        parse_mode="HTML"
-                    )
-                    os.remove(pdf_name)
+            # Всякий раз при запросе документа - СТРОГО PDF
+            if "[ФАЙЛ]" in ans or len(ans) > 200:
+                if not is_explicit_text:
+                    pdf_name = f"doc_{user_id}.pdf"
+                    pdf_success = await asyncio.to_thread(generate_pdf_gost, ans, pdf_name)
+                    
+                    await status.delete()
+                    if pdf_success and os.path.exists(pdf_name) and os.path.getsize(pdf_name) > 100:
+                        caption_txt = "📄 <b>Заполненный документ готов (PDF).</b>" if has_filled_data else "📄 <b>Ваш проект бланка готов (PDF).</b>"
+                        await m.answer_document(
+                            FSInputFile(pdf_name), 
+                            caption=caption_txt, 
+                            reply_markup=doc_ready_kb(is_filled=has_filled_data), 
+                            parse_mode="HTML"
+                        )
+                        os.remove(pdf_name)
+                    else:
+                        # ВАЖНО: НИКАКОГО ТЕКСТА ДОКУМЕНТА В ЧАТ ПРИ ОШИБКЕ!
+                        logging.error(f"[PDF] Ошибка генерации файла для {user_id}")
+                        await m.answer(
+                            "⚠️ <b>Не удалось сформировать PDF-файл.</b>\nПожалуйста, попробуйте сформулировать запрос иначе или повторите попытку.",
+                            reply_markup=get_back_kb(),
+                            parse_mode="HTML"
+                        )
                 else:
                     clean_a = clean_text_chat(ans)
-                    await m.answer(f"📄 <b>Ваш документ готов:</b>\n\n{clean_a}", reply_markup=doc_ready_kb(is_filled=has_filled_data), parse_mode="HTML")
+                    user_history[user_id]['h'].append({"role": "assistant", "content": clean_a})
+                    await status.edit_text(clean_a, reply_markup=get_back_kb(), parse_mode="HTML")
             else:
                 clean_a = clean_text_chat(ans)
                 user_history[user_id]['h'].append({"role": "assistant", "content": clean_a})
                 await status.edit_text(clean_a, reply_markup=get_back_kb(), parse_mode="HTML")
 
-        # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА (ОБЪЕКТИВНЫЙ + ДИАЛОГ)
+        # РЕЖИМ 3: РАЗБОР ДОКУМЕНТА (ОБЪЕКТИВНЫЙ + ПАМЯТЬ)
         elif curr == BotStates.doc_analyze_mode.state:
             if m.photo or m.document or len(input_text) > 300:
                 user_history[user_id]['doc_text'] = input_text
